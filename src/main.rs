@@ -1,56 +1,100 @@
-use std::env;
+use std::{env, ops::ControlFlow, sync::Arc};
 
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
-use tokio::net::TcpListener;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     select,
 };
+use tokio::{net::TcpListener, sync::Mutex};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 
-async fn main_host() {
-    println!("\nHOST\n");
+async fn main_bridge() {
+    println!("\nBRIDGE\n");
 
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("WebSocket server listening on 0.0.0.0:8080");
     let (stream, _) = listener.accept().await.unwrap();
     let ws_stream = accept_async(stream).await.unwrap();
-    let (mut ws_sink, mut ws_stream) = ws_stream.split();
+    let (ws_sink, ws_stream) = ws_stream.split();
+
+    let ws_sink = Arc::new(Mutex::new(ws_sink));
+    let ws_stream = Arc::new(Mutex::new(ws_stream));
 
     println!("waiting for browser connection");
 
     // wait user connection (from browser)
     let ttyd_addr = "127.0.0.1:9090";
     let ttyd_listener = TcpListener::bind(ttyd_addr).await.unwrap();
-    let (ttyd_stream, _) = ttyd_listener.accept().await.unwrap(); // http://127.0.0.1:9090
-    let (mut ttyd_reader, mut ttyd_writer) = tokio::io::split(ttyd_stream);
 
+    // handle connections from http://127.0.0.1:9090
+    while let Ok((ttyd_stream, _)) = ttyd_listener.accept().await {
+        println!("\nCONNECTION ACCEPTED\n");
+
+        let (ttyd_reader, ttyd_writer) = tokio::io::split(ttyd_stream);
+
+        let ws_sink_clone = Arc::clone(&ws_sink);
+        let ws_stream_clone = Arc::clone(&ws_stream);
+
+        tokio::spawn(handle_bridge_connection(
+            ttyd_reader,
+            ttyd_writer,
+            ws_sink_clone,
+            ws_stream_clone,
+        ));
+    }
+
+    println!("")
+}
+
+async fn handle_bridge_connection<S>(
+    mut ttyd_reader: ReadHalf<TcpStream>,
+    mut ttyd_writer: WriteHalf<TcpStream>,
+    ws_sink: Arc<Mutex<SplitSink<WebSocketStream<S>, Message>>>,
+    ws_stream: Arc<Mutex<SplitStream<WebSocketStream<S>>>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         select! {
             // read from (TTYD) webpage and send through websocket
-            _ = tcp_to_ws(&mut ttyd_reader, &mut ws_sink) => {}
+            ctrlf = tcp_to_ws(&mut ttyd_reader, ws_sink.clone()) => {
+                match ctrlf {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => break,
+                }
+            }
             // read from websocket and send to TTDY webpage
-            _ = ws_to_tcp(&mut ttyd_writer, &mut ws_stream) => {}
+            ctrlf = ws_to_tcp(&mut ttyd_writer, ws_stream.clone()) => {
+                match ctrlf {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => break,
+                }
+            }
         }
     }
+
+    println!("CONNECTION TERMINATED");
 }
 
 async fn main_device() {
     println!("\nDEVICE\n");
 
-    let url = "ws://192.168.1.24:8080";
+    let url = "ws://192.168.1.24:8080"; // ws://IP_ADDR_VM:PORT_WS_CONN
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect.");
-    let (mut ws_sink, mut ws_stream) = ws_stream.split();
+    let (ws_sink, ws_stream) = ws_stream.split();
 
-    // wait 1st message
-    let msg = ws_stream.next().await.unwrap().unwrap();
+    let ws_sink = Arc::new(Mutex::new(ws_sink));
+    let ws_stream = Arc::new(Mutex::new(ws_stream));
+
+    // wait 1st message (so to synchronize with the host before start interacting with TTYD)
+    let msg = ws_stream.lock().await.next().await.unwrap().unwrap();
 
     println!("connecting to ttyd");
 
@@ -64,43 +108,78 @@ async fn main_device() {
     loop {
         select! {
             // read from TTDY and send to WS
-            _ = tcp_to_ws(&mut ttyd_reader, &mut ws_sink) => {}
+            ctrlf = tcp_to_ws(&mut ttyd_reader, ws_sink.clone()) => {
+                match ctrlf {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => break,
+                }
+            }
             // wait for messages from WS and write them on TTYD
-            _ = ws_to_tcp(&mut ttyd_writer, &mut ws_stream) => {}
+            ctrlf = ws_to_tcp(&mut ttyd_writer, ws_stream.clone()) => {
+                match ctrlf {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => break,
+                }
+            }
         }
     }
 }
 
 async fn tcp_to_ws<S>(
     tcp_reader: &mut ReadHalf<TcpStream>,
-    ws_sink: &mut SplitSink<WebSocketStream<S>, Message>,
-) where
+    ws_sink: Arc<Mutex<SplitSink<WebSocketStream<S>, Message>>>,
+) -> ControlFlow<()>
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut buf = [0; 1024];
+    let n = tcp_reader.read(&mut buf).await.unwrap();
 
     println!("RECEIVED MESSAGE FROM TCP");
-    let n = tcp_reader.read(&mut buf).await.unwrap();
+
     println!("{n}");
+
+    // the socket has been closed (connection closed normally)
+    if n == 0 {
+        return ControlFlow::Break(());
+    }
+
     ws_sink
+        .lock()
+        .await
         .send(Message::Binary(buf[0..n].into()))
         .await
         .unwrap();
+
     println!("MESSAGE FORWARDED TO WS");
+
+    ControlFlow::Continue(())
 }
 
 async fn ws_to_tcp<S>(
     tcp_writer: &mut WriteHalf<TcpStream>,
-    ws_stream: &mut SplitStream<WebSocketStream<S>>,
-) where
+    ws_stream: Arc<Mutex<SplitStream<WebSocketStream<S>>>>,
+) -> ControlFlow<()>
+where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let msg = ws_stream.next().await.unwrap().unwrap();
-    println!("RECEIVED MESSAGE FROM WS");
-    if let Message::Binary(bytes) = msg {
-        tcp_writer.write_all(&bytes).await.unwrap();
-        tcp_writer.flush().await.unwrap();
-        println!("MESSAGE FORWARDED TO TCP");
+    let mut ws_stream = ws_stream.lock().await;
+    let res = ws_stream.next().await.unwrap();
+
+    match res {
+        Ok(msg) => {
+            println!("RECEIVED MESSAGE FROM WS");
+            if let Message::Binary(bytes) = msg {
+                tcp_writer.write_all(&bytes).await.unwrap();
+                tcp_writer.flush().await.unwrap();
+                println!("MESSAGE FORWARDED TO TCP");
+            }
+            ControlFlow::Continue(())
+        }
+        Err(err) => {
+            eprintln!("WS error: {}", err);
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -109,7 +188,7 @@ async fn main() {
     let args = env::args().nth(1).expect("argument");
 
     match args.as_str() {
-        "host" => main_host().await,
+        "bridge" => main_bridge().await,
         "device" => main_device().await,
         _ => panic!(),
     }
