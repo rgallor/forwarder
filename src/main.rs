@@ -1,398 +1,631 @@
-use std::{collections::HashMap, env, io::Error, sync::Arc};
+use std::fmt::Display;
+use std::io;
+use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::{collections::HashMap, env};
 
 use futures_util::{stream::StreamExt, SinkExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc::error::SendError;
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{tcp::OwnedWriteHalf, TcpStream},
+    net::TcpStream,
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    task::JoinHandle,
 };
-use tokio::{net::TcpListener, sync::Mutex};
-use tokio_tungstenite::accept_async;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{accept_async, WebSocketStream};
+use tracing::{debug, error, info, instrument, warn};
+use tracing_subscriber::{prelude::*, EnvFilter};
 use tungstenite::Message;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
-enum BridgeMsg {
-    NewConnection(usize),
-    CloseConnection(usize),
-    Data(usize, Vec<u8>),
+// // Include the `items` module, which is generated from items.proto.
+// pub mod items {
+//     include!(concat!(env!("OUT_DIR"), "/forwarder.items.rs"));
+// }
+
+struct ConnectionHandle {
+    handle: JoinHandle<()>,
+    tx_con: UnboundedSender<ConnMsg>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-enum DeviceMsg {
-    Reply(usize, Vec<u8>),
-    CloseConnection(usize),
+impl Deref for ConnectionHandle {
+    type Target = JoinHandle<()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
 }
 
-struct Connection {
-    id: usize,
-    tcp_writer: OwnedWriteHalf,
-    reader_handle: JoinHandle<()>,
+impl DerefMut for ConnectionHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
 }
 
-impl Connection {
-    fn new(id: usize, tcp_stream: TcpStream, tx: UnboundedSender<(usize, Vec<u8>)>) -> Self {
-        let (mut tcp_reader, tcp_writer) = tcp_stream.into_split();
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+struct Id {
+    port: u16,
+    host: Arc<String>,
+}
 
-        // spawn a task responsible for notifying when new data is available on the TCP reader
-        let reader_handle = tokio::spawn(async move {
-            let mut buf = [0; 1024];
+impl Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({},{})", self.port, self.host)
+    }
+}
 
-            while let Ok(()) = tcp_reader.readable().await {
-                let n = tcp_reader.read(&mut buf).await.unwrap();
-                tx.send((id, buf[0..n].to_vec()))
-                    .expect("error while sending on channel");
-            }
+#[derive(Debug)]
+struct Transmitted {
+    id: Id,
+    msg: ConnMsg,
+}
 
-            println!("TCP reader not readable anymore");
-        });
-
+impl Transmitted {
+    fn data(id: Id, data: Vec<u8>) -> Self {
         Self {
             id,
-            tcp_writer,
-            reader_handle,
+            msg: ConnMsg::Data(data),
         }
     }
 
-    async fn close(&mut self) -> Result<(), Error> {
-        // sending CloseConnection msg to bridge
-        let close_msg = BridgeMsg::CloseConnection(self.id);
-        let bytes = bson::to_vec(&close_msg).expect("failed to serialize COnnectionClose message");
+    fn eot(id: Id) -> Self {
+        Self {
+            id,
+            msg: ConnMsg::Eot,
+        }
+    }
 
-        self.tcp_writer
-            .write_all(&bytes)
-            .await
-            .expect("error while writing data on tcp writer");
+    fn close(id: Id) -> Self {
+        Self {
+            id,
+            msg: ConnMsg::Close,
+        }
+    }
+}
 
-        // close the writer half of the TCP stream and flush any remaining data in the writer before closing
-        self.tcp_writer.shutdown().await?;
-        self.tcp_writer.flush().await?;
+#[derive(Debug)]
+enum ConnMsg {
+    Data(Vec<u8>),
+    Eot,
+    Close,
+}
 
-        // abort the task responsible for sending TCP data to the
-        self.reader_handle.abort();
+#[derive(Debug, Default)]
+enum ConnState {
+    #[default]
+    ReadWrite,
+    Read,
+    Write,
+    Closed,
+}
+
+impl Display for ConnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnState::ReadWrite => write!(f, "ReadWrite"),
+            ConnState::Read => write!(f, "Read"),
+            ConnState::Write => write!(f, "Write"),
+            ConnState::Closed => write!(f, "Closed"),
+        }
+    }
+}
+
+impl ConnState {
+    fn shutdown_read(&mut self) {
+        match self {
+            ConnState::ReadWrite => {
+                let _ = std::mem::replace(self, ConnState::Write);
+            }
+            ConnState::Read => {
+                let _ = std::mem::replace(self, ConnState::Closed);
+            }
+            ConnState::Write | ConnState::Closed => {}
+        }
+    }
+
+    fn shutdown_write(&mut self) {
+        match self {
+            ConnState::ReadWrite => {
+                let _ = std::mem::replace(self, ConnState::Read);
+            }
+            ConnState::Write => {
+                let _ = std::mem::replace(self, ConnState::Closed);
+            }
+            ConnState::Read | ConnState::Closed => {}
+        }
+    }
+
+    fn can_write(&self) -> bool {
+        matches!(self, ConnState::ReadWrite | ConnState::Write)
+    }
+}
+
+enum Either {
+    Read(std::io::Result<usize>),
+    Write(Option<ConnMsg>),
+}
+
+#[derive(Debug)]
+struct Connection<T> {
+    id: Id,
+    stream: T,
+    state: ConnState,
+    tx_ws: UnboundedSender<Transmitted>,
+    rx_con: UnboundedReceiver<ConnMsg>,
+}
+
+impl<T> Connection<T> {
+    fn new(
+        id: Id,
+        stream: T,
+        tx_ws: UnboundedSender<Transmitted>,
+        rx_con: UnboundedReceiver<ConnMsg>,
+    ) -> Self {
+        Self {
+            id,
+            stream,
+            state: ConnState::default(),
+            tx_ws,
+            rx_con,
+        }
+    }
+
+    fn spawn(self, tx_con: UnboundedSender<ConnMsg>) -> ConnectionHandle
+    where
+        T: Send + AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        // spawn a task responsible for notifying when new data is available on the TCP reader
+        let handle = tokio::spawn(self.task());
+        ConnectionHandle { handle, tx_con }
+    }
+
+    async fn task(mut self)
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        if let Err(err) = self.task_loop().await {
+            error!("error while reading/writing, {err}");
+        }
+
+        self.tx_ws
+            .send(Transmitted::close(self.id))
+            .expect("failed to send over tx_ws channel");
+    }
+
+    #[instrument(skip_all)]
+    async fn task_loop(&mut self) -> io::Result<()>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut buf = vec![0u8; 1024];
+
+        // TODO: add timeout
+        // select return None if the connection state is Closed
+        while let Some(r_w) = self.select(&mut buf).await {
+            match r_w {
+                Either::Read(data) => self.handle_tcp_read(data, &buf)?,
+                Either::Write(opt) => self.handle_tcp_write(opt).await?,
+            }
+        }
+
+        info!("connection state Closed, exiting...");
 
         Ok(())
     }
-}
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // call the close method to gracefully close the TCP connection
-        if let Err(err) = tokio::runtime::Handle::current().block_on(self.close()) {
-            eprintln!("Error while closing connection: {:?}", err);
+    async fn select(&mut self, buf: &mut [u8]) -> Option<Either>
+    where
+        T: AsyncRead + Unpin,
+    {
+        match self.state {
+            ConnState::ReadWrite | ConnState::Read => Some(select! {
+                res = self.stream.read(buf) => Either::Read(res),
+                opt = self.rx_con.recv() => Either::Write(opt),
+            }),
+            ConnState::Write => Some(Either::Write(self.rx_con.recv().await)),
+            ConnState::Closed => None,
+        }
+    }
+
+    /// Read from tcp.
+    #[instrument(skip(self, buf), fields(id = %self.id, state = %self.state))]
+    fn handle_tcp_read(&mut self, bytes: io::Result<usize>, buf: &[u8]) -> io::Result<()> {
+        let msg = bytes.map(|bytes| {
+            info!("received {bytes} bytes");
+            let id = self.id.clone();
+            match bytes {
+                0 => {
+                    self.state.shutdown_read();
+                    info!("changed read state");
+                    Transmitted::eot(id)
+                }
+                n => Transmitted::data(id, buf[0..n].to_vec()),
+            }
+        })?;
+
+        self.tx_ws
+            .send(msg)
+            .expect("error while sending on channel");
+        Ok(())
+    }
+
+    /// Write to tcp.
+    #[instrument(skip_all, fields(id = %self.id, state = %self.state))]
+    async fn handle_tcp_write(&mut self, data: Option<ConnMsg>) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        let data = data.unwrap_or_else(|| {
+            error!("tcp channel dropped");
+            ConnMsg::Close
+        });
+
+        match data {
+            ConnMsg::Data(data) if data.is_empty() => {
+                error!("received 0 bytes from ws, shutting down write");
+                self.shutdown_write().await?;
+                info!("changed write state after receiving 0 bytes");
+            }
+            ConnMsg::Eot => {
+                info!("eot received, shutting down write");
+                self.shutdown_write().await?;
+                info!("changed write state after receiving eot");
+            }
+            ConnMsg::Data(data) => {
+                info!("received {} bytes from ws", data.len());
+
+                if !self.state.can_write() {
+                    warn!("not allowed to write");
+                    return Ok(());
+                }
+
+                self.stream.write_all(&data).await?;
+            }
+            ConnMsg::Close => {
+                // connection has already been closed
+                info!("connection closed");
+                self.stream.shutdown().await?;
+                self.state = ConnState::Closed;
+            }
         }
 
-        println!("closing connection {}", self.id);
+        Ok(())
+    }
+
+    async fn shutdown_write(&mut self) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        self.state.shutdown_write();
+        self.stream.shutdown().await
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Debug)]
+struct WsTransmitted {
+    id: Id,
+    msg: WsMsg,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum WsMsg {
+    NewConnection, // TODO: use Transport (TCP or UDP)
+    Eot,
+    CloseConnection,
+    Data(Vec<u8>),
+}
+
+// #[derive(Serialize, Deserialize, Debug)]
+// enum Transport {
+//     Tcp,
+//     Udp,
+// }
+
 struct Connections {
-    id_count: usize,
-    connections: Arc<Mutex<HashMap<usize, Connection>>>,
-    tx: UnboundedSender<(usize, Vec<u8>)>,
-    rx: Arc<Mutex<UnboundedReceiver<(usize, Vec<u8>)>>>,
+    connections: HashMap<Id, ConnectionHandle>,
+    tx_ws: UnboundedSender<Transmitted>,
 }
 
 impl Connections {
-    fn new() -> Self {
+    fn new() -> (Self, UnboundedReceiver<Transmitted>) {
         // this channel is used by tasks associated to each connection to communicate new
-        // information available on a given tcp reader handle (associated to an usize connection ID).
+        // information available on a given tcp reader handle (associated to an u16 connection ID).
         // it is also used to forward the incoming data to the device over the websocket connection
-        let (tx, rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>();
-        let rx = Arc::new(Mutex::new(rx));
+        let (tx_ws, rx_ws) = mpsc::unbounded_channel();
 
-        Self {
-            id_count: 1,
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            tx,
-            rx,
-        }
+        let connections = Self {
+            connections: HashMap::new(),
+            tx_ws,
+        };
+
+        (connections, rx_ws)
     }
 
     // insertion of a new connection given a tcp_stream
-    async fn new_connection(&mut self, tcp_stream: TcpStream) -> Option<usize> {
-        let id = self.id_count;
-        let tx = self.tx.clone();
-        let connection = Connection::new(id, tcp_stream, tx);
+    async fn add_connection(&mut self, tcp_stream: TcpStream, id: Id) {
+        let (tx_con, rx_con) = mpsc::unbounded_channel();
+
+        let tx_ws = self.tx_ws.clone();
+        let connection = Connection::new(id.clone(), tcp_stream, tx_ws, rx_con).spawn(tx_con);
 
         // because the id_count is internally managed, this function should always return Some(id)
         // otherwise it would mean that a new connection with the same ID of an existing one is openned
-        match self.connections.lock().await.insert(id, connection) {
-            None => {
-                // increment the id_count for next insertions
-                self.id_count
-                    .checked_add(1)
-                    .expect("overflow occurred when incrementing connection ID");
-                Some(id)
-            }
-            _ => None,
+
+        if self.connections.insert(id, connection).is_some() {
+            error!("connection replaced");
         }
     }
 
-    async fn forward_to_browser(&mut self, msg: Message) -> Result<(), ()> {
+    // TODO: define method get_connection and return error
+    #[instrument(skip_all)]
+    async fn handle_msg(&mut self, msg: Message) -> Result<(), SendError<ConnMsg>> {
         match msg {
             Message::Binary(bytes) => {
-                let device_msg: DeviceMsg =
+                let WsTransmitted { id, msg } =
                     bson::from_slice(&bytes).expect("failed to deserialize");
 
-                match device_msg {
-                    // handle the reception of new data by forwarding them through the TCP connection
-                    DeviceMsg::Reply(id, data) => {
-                        let mut connections = self.connections.lock().await;
-                        let connection = match connections.get_mut(&id) {
-                            Some(conn) => conn,
-                            None => return Err(()),
+                match msg {
+                    // this will be called only by a device when a NewConnection msg is received
+                    WsMsg::NewConnection => {
+                        debug!("new connection received, {id}");
+
+                        let ttyd_addr = "127.0.0.1:7681"; // TTYD
+                        let ttdy_stream = match tokio::net::TcpStream::connect(ttyd_addr).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                error!(?err);
+                                return Ok(());
+                            }
                         };
 
-                        connection
-                            .tcp_writer
-                            .write_all(&data)
-                            .await
-                            .expect("error while writing data on tcp writer");
+                        debug!("connection accepted: {id}");
+
+                        self.add_connection(ttdy_stream, id).await;
+                    }
+
+                    // handle the reception of new data by forwarding them through the TCP connection
+                    WsMsg::Data(data) => {
+                        let Some(connection) = self.connections.get_mut(&id) else {
+                            error!("connection {id} not found, discarding data");
+                            // TODO: discard received data if they belong to a different generation
+                            return Ok(());
+                        };
+
+                        connection.tx_con.send(ConnMsg::Data(data))?;
+                    }
+                    WsMsg::Eot => {
+                        let Some(connection) = self.connections.get_mut(&id) else {
+                            error!("connection {id} not found, discarding data");
+                            return Ok(());
+                        };
+
+                        connection.tx_con.send(ConnMsg::Eot)?;
                     }
                     // handle the closure of a connection
-                    DeviceMsg::CloseConnection(id) => {
-                        // removing the connection from the hashmap will automatically call the drop() method
-                        // on the connection, which has been implemented to gracefully shut down the TCP connection
-                        if self.connections.lock().await.remove(&id).is_none() {
-                            return Err(()); // this occurs in case there no exist a connection with the provided id
+                    WsMsg::CloseConnection => {
+                        match self.connections.remove(&id) {
+                            Some(con) => {
+                                if let Err(err) = con.tx_con.send(ConnMsg::Close) {
+                                    debug!("connection {id} already closed, {err}");
+                                }
+                                info!("connection closed: {id}");
+                            }
+                            // this occurs in case there no exist a connection with the provided id
+                            None => warn!("connection {id} already removed"),
                         }
                     }
                 }
             }
             // wrong Message type
-            _ => return Err(()),
+            _ => error!("unhandled message type: {msg:?}"),
         }
 
         Ok(())
     }
-
-    async fn recv_from_tcp(&mut self) -> Option<(usize, Vec<u8>)> {
-        self.rx.lock().await.recv().await
-    }
 }
 
-async fn main_bridge() {
+async fn main_bridge() -> color_eyre::Result<()> {
     // TODO: use tracing to log
     println!("\nBRIDGE\n");
 
     // use IP 0.0.0.0 so that it is possible to receive any traffic directed to port 8080
-    let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:8080").await?;
     println!("WebSocket server listening on 0.0.0.0:8080");
-    let (stream, _) = listener.accept().await.unwrap();
-    let ws_stream = accept_async(stream).await.unwrap();
-    let (ws_sink, mut ws_stream) = ws_stream.split();
-    let ws_sink = Arc::new(Mutex::new(ws_sink));
+    let (stream, _) = listener.accept().await?;
+    let mut ws_stream = accept_async(stream).await?;
 
     println!("-------------------------------");
     println!("waiting for browser connections");
 
     // open the browser on the following address
-    let ttyd_addr = "127.0.0.1:9090";
-    let ttyd_listener = TcpListener::bind(ttyd_addr).await.unwrap();
+    let browser_addr = "127.0.0.1:9090";
+    let browser_listener = TcpListener::bind(browser_addr).await?;
 
     println!("-------------------------------");
     println!("handle browser connections");
 
     // map used to keep track of all the connections
-    let mut connections = Connections::new();
-
-    let ws_sink_clone = Arc::clone(&ws_sink);
-    let mut connections_clone = connections.clone();
-
-    // spawn a task responsible for the handling of new connections
-    let new_connections_handle = tokio::spawn(async move {
-        while let Ok((browser_stream, _)) = ttyd_listener.accept().await {
-            // if case the inseriton of a new connections fails
-            let id = match connections_clone.new_connection(browser_stream).await {
-                Some(id) => id,
-                None => panic!("failed to add connection to hashmap"),
-            };
-
-            println!("connection accepted: {id}");
-
-            // communicate to the device that a new connection has been established
-            let msg = BridgeMsg::NewConnection(id);
-            let bytes = bson::to_vec(&msg).expect("failed to serialize BridgeMsg");
-            ws_sink_clone
-                .lock()
-                .await
-                .send(Message::Binary(bytes))
-                .await
-                .unwrap();
-        }
-    });
+    let (mut connections, mut rx) = Connections::new();
 
     // wait for one of the possible events:
+    // - a new connection has been accepted
     // - the device sent data on the websocket channel, which must be forwarded to the correct connection
     // - the browser connection has data available, which must be forwarded to the device
     loop {
-        select! {
-            msg = ws_stream.next() => {
-                println!("msg received from WS");
-                let cloned_msg = msg.unwrap().unwrap().clone();
-                connections.forward_to_browser(cloned_msg).await.expect("error while forwarding the message to browser");
+        match select_bridge(&browser_listener, &mut rx, &mut ws_stream).await {
+            Receive::Connection(connection) => {
+                let (browser_stream, addr) = connection?;
+                handle_new_connection(
+                    browser_stream,
+                    &addr,
+                    String::from("HOST"),
+                    &mut connections,
+                    &mut ws_stream,
+                )
+                .await;
             }
-            res = connections.recv_from_tcp() => {
-                match res {
-                    Some((id, data)) => {
-                        println!("{}: {} bytes received from TCP connection", id, data.len());
-
-                        let bridge_data = BridgeMsg::Data(id, data);
-                        let bytes = bson::to_vec(&bridge_data).expect("failed to serialize bridge data");
-                        let msg = Message::Binary(bytes);
-                        ws_sink.lock().await.send(msg).await.expect("failed to send data on websocket toward device");
-                    }
-                    None => break
-                }
+            Receive::Tcp(transmitted) => {
+                recv_tcp(transmitted, &mut ws_stream).await;
+            }
+            Receive::Ws(msg) => {
+                recv_ws(msg.unwrap().unwrap(), &mut connections).await;
             }
         }
     }
+}
 
-    // before exiting
-    new_connections_handle.abort();
+enum Receive {
+    Connection(std::io::Result<(TcpStream, SocketAddr)>),
+    Tcp(Option<Transmitted>),
+    Ws(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
+}
+
+async fn select_bridge(
+    browser_listener: &TcpListener,
+    rx: &mut UnboundedReceiver<Transmitted>,
+    ws_stream: &mut WebSocketStream<TcpStream>,
+) -> Receive {
+    select! {
+        connection = browser_listener.accept() => Receive::Connection(connection),
+        data = rx.recv() => Receive::Tcp(data),
+        msg = ws_stream.next() => Receive::Ws(msg),
+    }
+}
+
+#[instrument(skip_all)]
+async fn handle_new_connection(
+    browser_stream: TcpStream,
+    addr: &SocketAddr,
+    host: String,
+    connections: &mut Connections,
+    ws_stream: &mut WebSocketStream<TcpStream>,
+) {
+    // if case the inseriton of a new connections fails
+
+    let id = Id {
+        port: addr.port(),
+        host: Arc::new(host),
+    };
+    connections.add_connection(browser_stream, id.clone()).await;
+
+    info!("connection accepted: {}", id);
+
+    // communicate to the device that a new connection has been establishedother
+    let msg = WsTransmitted {
+        id,
+        msg: WsMsg::NewConnection,
+    };
+    let bytes = bson::to_vec(&msg).expect("failed to serialize BridgeMsg");
+    ws_stream.send(Message::Binary(bytes)).await.unwrap();
+}
+
+#[instrument(skip_all)]
+async fn recv_tcp<T>(data: Option<Transmitted>, ws_stream: &mut WebSocketStream<T>)
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match data {
+        Some(Transmitted { id, msg }) => {
+            // close the connection if no data is sent
+            let bridge_data = match msg {
+                ConnMsg::Data(data) => {
+                    info!("{}: {} bytes received from TCP connection", id, data.len());
+                    WsTransmitted {
+                        id,
+                        msg: WsMsg::Data(data),
+                    }
+                }
+                ConnMsg::Eot => {
+                    info!("eot received, closing connection {id}");
+
+                    WsTransmitted {
+                        id,
+                        msg: WsMsg::Eot,
+                    }
+                }
+                ConnMsg::Close => {
+                    info!("tcp closed, closing connection {id}");
+
+                    WsTransmitted {
+                        id,
+                        msg: WsMsg::CloseConnection,
+                    }
+                }
+            };
+
+            let bytes = bson::to_vec(&bridge_data).expect("failed to serialize bridge data");
+            let msg = Message::Binary(bytes);
+            ws_stream
+                .send(msg)
+                .await
+                .expect("failed to send data on websocket toward device");
+        }
+        // rx hand side of the channel read None, therefore the connection has been closed
+        None => {
+            warn!("rx hand side of the channel read None, all connections have been closed");
+        }
+    }
+}
+
+#[instrument(skip_all)]
+async fn recv_ws(msg: Message, connections: &mut Connections) {
+    if let Err(err) = connections.handle_msg(msg).await {
+        error!(?err);
+    }
 }
 
 async fn main_device() {
+    // TODO: use tracing to log
     println!("\nDEVICE\n");
 
-    // open a websocket connection with the bridge
-    let url = "ws://192.168.122.36:8080"; // ws://IP_ADDR_VM:PORT_WS_CONN
-    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect.");
-    let (mut ws_sink, mut ws_stream) = ws_stream.split();
+    // use IP 0.0.0.0 so that it is possible to receive any traffic directed to port 8080
+    let (mut ws_stream, _) = connect_async("ws://192.168.122.36:8080").await.unwrap();
 
-    println!("------------------");
-    println!("connecting to ttyd");
+    println!("-------------------------------");
+    println!("waiting for browser connections");
 
-    let ttyd_addr = "127.0.0.1:7681"; // TTYD
-    let ttdy_stream = tokio::net::TcpStream::connect(ttyd_addr).await.unwrap();
-    let (mut ttyd_reader, mut ttyd_writer) = tokio::io::split(ttdy_stream);
+    // map used to keep track of all the connections
+    let (mut connections, mut rx) = Connections::new();
 
-    println!("------------------");
-    println!("handling connections");
-
-    // define a collection of connections, each one associated with an ID and a status (open = true, closed = false)
-    let mut connections: HashMap<usize, bool> = HashMap::new();
-
-    // wait 1st connection (so to synchronize with the host before starting the interaction with TTYD)
-
-    // listens for Bridge messages and handles the connections
-    while let Some(res) = ws_stream.next().await {
-        let msg = res.expect("Tung error while receiving on ws stream");
-
-        let bridge_msg: BridgeMsg = match msg {
-            Message::Binary(bytes) => {
-                bson::from_slice(bytes.as_slice()).expect("failed to exec BSON deserialize")
-            }
-            _ => panic!("wrong tungstenite message type received"),
-        };
-
-        match bridge_msg {
-            BridgeMsg::NewConnection(id) => {
-                // check if the connection has already been opened, eventually printing an error.
-                // if not, store a new connection in the hashmap and set its status as open (true)
-                if let Some(_val) = connections.insert(id, true) {
-                    eprintln!("connection already existent");
-                }
-
-                println!("new connection: {id}");
-            }
-            BridgeMsg::CloseConnection(id) => {
-                // check if the connection exists. if not, it means it has never been opened -> print error.
-                // if it exists, check if the status is true (still open) or false (closed).
-                // if open, close it gracefully sending a CloseConnection DeviceMsg to the bridge, otherwise print error
-                match connections.get_mut(&id) {
-                    None => eprintln!("connection {id} does not exists"),
-                    Some(status) if !*status => {
-                        eprintln!("connection {id} has already been closed")
-                    }
-                    Some(status) => {
-                        *status = false;
-
-                        // send a DeviceMsg to the bridge telling that the conneciton has been properly closed
-                        let msg = DeviceMsg::CloseConnection(id);
-                        let bytes = bson::to_vec(&msg).expect("failed to serialize to bson");
-                        ws_sink
-                            .send(Message::Binary(bytes))
-                            .await
-                            .expect("error while sending message on the device-bridge ws");
-
-                        println!("connection {id} closed");
-                    }
+    loop {
+        select! {
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(msg)) => recv_ws(msg, &mut connections).await,
+                    Some(Err(err)) => error!(?err),
+                    None => {
+                        error!("stream closed");
+                        break;
+                    },
                 }
             }
-            // forward the traffic to TTYD, wait response data from TTYD, and forward it to the bridge via ws
-            BridgeMsg::Data(id, data) => {
-                // check if the connection exists, eventually printing an error and returning
-                match connections.get_mut(&id) {
-                    None => eprintln!("connection {id} does not exists"),
-                    Some(status) if !*status => {
-                        eprintln!("connection {id} has already been closed")
-                    }
-                    Some(status) => {
-                        // forward the traffic to TTYD
-                        ttyd_writer.write_all(data.as_slice()).await.unwrap();
-                        ttyd_writer.flush().await.unwrap();
-
-                        println!("{}: {} bytes forwarded onto TCP connection", id, data.len());
-
-                        // TODO: maybe TTYD doesn't send back any data. In that case, 0 bytes are read and the
-                        // connection is closed, even though it shouldn't.
-                        // (e.g., before being able to receive data from TTYD, it may be necessary to receive more
-                        //  than one Bridge::Data message).
-
-                        // wait data from TTYD
-                        let mut buf = [0; 1024];
-                        while let Ok(n) = ttyd_reader.read(&mut buf).await {
-                            // the socket has been closed (connection closed normally).
-                            // it should occur in case the connection between the device and TTYD is terminated
-                            // or when no data is temporarily available.
-                            // TODO: check that, in case no data is temporarily available but the connection is still open there is no deadlock condition.
-                            if n == 0 {
-                                // update the connection status to closed (false) and communicate it to the bridge.
-                                *status = false;
-
-                                // send a DeviceMsg to the bridge telling that the conneciton has been properly closed
-                                let msg = DeviceMsg::CloseConnection(id);
-                                let bytes =
-                                    bson::to_vec(&msg).expect("failed to serialize to bson");
-                                ws_sink
-                                    .send(Message::Binary(bytes))
-                                    .await
-                                    .expect("error while sending message on the device-bridge ws");
-
-                                println!("{id}: 0 bytes read, closing connection");
-
-                                break;
-                            }
-
-                            // forward the data to the bridge via ws
-                            let msg = DeviceMsg::Reply(id, buf[0..n].into());
-                            let bytes =
-                                bson::to_vec(&msg).expect("failed to serialize DeviceMsg to BSON");
-                            ws_sink.send(Message::Binary(bytes)).await.unwrap();
-
-                            println!("{}: {} bytes read and sent onto WS", id, data.len());
-                        }
-                    }
-                }
+            id_data = rx.recv() => {
+                recv_tcp(id_data, &mut ws_stream).await;
             }
         }
     }
 }
 
 #[tokio::main]
-async fn main() {
-    let args = env::args().nth(1).expect("argument not found");
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install().unwrap();
+    tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(tracing_subscriber::fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .try_init()?;
 
-    match args.as_str() {
-        "bridge" => main_bridge().await,
-        "device" => main_device().await,
+    match env::args().nth(1).as_deref() {
+        Some("bridge") => main_bridge().await?,
+        Some("device") => main_device().await,
         _ => panic!(),
     }
+
+    Ok(())
 }

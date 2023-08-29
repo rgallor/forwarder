@@ -8,7 +8,16 @@ edition = "2021"
 [dependencies]
 bson = "2.6.1"
 futures-util = "0.3.28"
-serde = "1.0.180"
-tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0.180", features = ["rc"] }
+tokio = { version = "1", features = ["full", "tracing"] }
 tokio-tungstenite = "0.20.0"
 tungstenite = "0.20.0"
+console-subscriber = "0.1.10"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+color-eyre = "0.6.2"
+prost = "0.12.0"
+prost-types = "0.12.0"
+
+[build-dependencies]
+prost-build = "0.12.0"
