@@ -10,5 +10,6 @@ bson = "2.6.1"
 futures-util = "0.3.28"
 serde = "1.0.180"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.14"
 tokio-tungstenite = "0.20.0"
 tungstenite = "0.20.0"
