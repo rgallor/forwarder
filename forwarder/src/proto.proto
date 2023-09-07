@@ -1,13 +1,12 @@
 syntax = "proto3";
 
-package forwarder.items;
+package forwarder.proto;
 
 message WsTransmitted {
   Id id = 1;
   WsMsg msg = 2;
 }
 
- // TODO: implement TryFrom and into Id (with u16 and Arc<String>)
 message Id {
   uint32 port = 1;
   string host = 2;
