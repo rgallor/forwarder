@@ -448,7 +448,11 @@ impl Connections {
         }
     }
 
-    // TODO: define method get_connection and return error
+    #[instrument(skip_all)]
+    fn get_connection(&mut self, id: &Id) -> Option<&mut ConnectionHandle> {
+        self.connections.get_mut(&id)
+    }
+
     #[instrument(skip_all)]
     async fn handle_msg(&mut self, msg: Message) -> Result<(), SendError<ConnMsg>> {
         match msg {
@@ -477,23 +481,20 @@ impl Connections {
                     }
 
                     // handle the reception of new data by forwarding them through the TCP connection
-                    WsMsg::Data(data) => {
-                        let Some(connection) = self.connections.get_mut(&id) else {
-                            error!("connection {id} not found, discarding data");
-                            // TODO: discard received data if they belong to a different generation
-                            return Ok(());
-                        };
-
-                        connection.tx_con.send(ConnMsg::Data(data))?;
-                    }
-                    WsMsg::Eot => {
-                        let Some(connection) = self.connections.get_mut(&id) else {
+                    WsMsg::Data(data) => match self.get_connection(&id) {
+                        Some(connection) => connection.tx_con.send(ConnMsg::Data(data))?,
+                        None => {
                             error!("connection {id} not found, discarding data");
                             return Ok(());
-                        };
-
-                        connection.tx_con.send(ConnMsg::Eot)?;
-                    }
+                        }
+                    },
+                    WsMsg::Eot => match self.get_connection(&id) {
+                        Some(connection) => connection.tx_con.send(ConnMsg::Eot)?,
+                        None => {
+                            error!("connection {id} not found, discarding data");
+                            return Ok(());
+                        }
+                    },
                     // handle the closure of a connection
                     WsMsg::CloseConnection => {
                         match self.connections.remove(&id) {
