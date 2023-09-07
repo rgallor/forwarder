@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, env};
 
 use futures_util::{stream::StreamExt, SinkExt};
+use prost::Message as ProstMsg;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::SendError;
@@ -24,10 +25,71 @@ use tungstenite::Message;
 
 use serde::{Deserialize, Serialize};
 
-// // Include the `items` module, which is generated from items.proto.
-// pub mod items {
-//     include!(concat!(env!("OUT_DIR"), "/forwarder.items.rs"));
-// }
+// Include the `items` module, which is generated from items.proto.
+pub mod items {
+    include!(concat!(env!("OUT_DIR"), "/forwarder.items.rs"));
+}
+
+impl TryFrom<items::WsTransmitted> for WsTransmitted {
+    type Error = ();
+
+    fn try_from(value: items::WsTransmitted) -> Result<Self, Self::Error> {
+        let items::WsTransmitted { id, msg } = value;
+
+        let id = id.map(|id| id.try_into()).unwrap()?;
+        let msg = msg.map(|ws_msg| ws_msg.into()).unwrap();
+
+        let res = WsTransmitted { id, msg };
+        Ok(res)
+    }
+}
+
+impl TryFrom<items::Id> for Id {
+    type Error = (); // TODO: return a new error type
+
+    fn try_from(value: items::Id) -> Result<Self, Self::Error> {
+        let items::Id { port, host } = value;
+
+        let port = u16::try_from(port).map_err(|_| ())?;
+        let host = Arc::new(host);
+
+        let id = Id { port, host };
+        Ok(id)
+    }
+}
+
+impl From<items::ws_msg::WsMsgType> for WsMsg {
+    fn from(value: items::ws_msg::WsMsgType) -> Self {
+        match value {
+            items::ws_msg::WsMsgType::NewConnection(_) => WsMsg::NewConnection,
+            items::ws_msg::WsMsgType::Eot(_) => WsMsg::Eot,
+            items::ws_msg::WsMsgType::CloseConnection(_) => WsMsg::CloseConnection,
+            items::ws_msg::WsMsgType::Data(items::Data { data }) => WsMsg::Data(data),
+        }
+    }
+}
+
+impl From<WsMsg> for items::ws_msg::WsMsgType {
+    fn from(value: WsMsg) -> Self {
+        match value {
+            WsMsg::NewConnection => Self::NewConnection(items::NewConnection {}),
+            WsMsg::Eot => Self::Eot(items::Eot {}),
+            WsMsg::CloseConnection => Self::CloseConnection(items::CloseConnection {}),
+            WsMsg::Data(data) => Self::Data(items::Data { data }),
+        }
+    }
+}
+
+impl From<items::WsMsg> for WsMsg {
+    fn from(value: items::WsMsg) -> Self {
+        value
+            .ws_msg_type
+            .map(|msg_type| msg_type.into())
+            .expect("WsMsgType empty")
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------------------
 
 struct ConnectionHandle {
     handle: JoinHandle<()>,
@@ -307,10 +369,40 @@ impl<T> Connection<T> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 struct WsTransmitted {
     id: Id,
     msg: WsMsg,
+}
+
+impl WsTransmitted {
+    fn encode(self) -> Result<Vec<u8>, ()> {
+        let mut id = items::Id::default();
+        id.port = self.id.port.into();
+        id.host = self.id.host.to_string(); //.expect("failed to remove String from Arc");
+
+        let mut msg = items::WsMsg::default();
+        msg.ws_msg_type = Some(self.msg.into());
+
+        let mut transmitted_msg = items::WsTransmitted::default();
+        transmitted_msg.id = Some(id);
+        transmitted_msg.msg = Some(msg);
+
+        let mut buf = Vec::new();
+        let buf_size = transmitted_msg.encoded_len();
+        buf.reserve(buf_size);
+
+        transmitted_msg
+            .encode(&mut buf)
+            .expect("failed to serialize WsTransmitted");
+
+        Ok(buf)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ()> {
+        let msg_transmitted = items::WsTransmitted::decode(bytes).map_err(|_| ())?;
+        WsTransmitted::try_from(msg_transmitted)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -320,12 +412,6 @@ enum WsMsg {
     CloseConnection,
     Data(Vec<u8>),
 }
-
-// #[derive(Serialize, Deserialize, Debug)]
-// enum Transport {
-//     Tcp,
-//     Udp,
-// }
 
 struct Connections {
     connections: HashMap<Id, ConnectionHandle>,
@@ -367,8 +453,9 @@ impl Connections {
     async fn handle_msg(&mut self, msg: Message) -> Result<(), SendError<ConnMsg>> {
         match msg {
             Message::Binary(bytes) => {
-                let WsTransmitted { id, msg } =
-                    bson::from_slice(&bytes).expect("failed to deserialize");
+                let msg_transmitted = WsTransmitted::decode(&bytes)
+                    .expect("failed to deserialize from bytes to WsTransmitted");
+                let WsTransmitted { id, msg } = msg_transmitted;
 
                 match msg {
                     // this will be called only by a device when a NewConnection msg is received
@@ -464,7 +551,7 @@ async fn main_bridge() -> color_eyre::Result<()> {
                 handle_new_connection(
                     browser_stream,
                     &addr,
-                    String::from("HOST"),
+                    String::from("HOST"), // TODO: use non-static host
                     &mut connections,
                     &mut ws_stream,
                 )
@@ -521,7 +608,11 @@ async fn handle_new_connection(
         id,
         msg: WsMsg::NewConnection,
     };
-    let bytes = bson::to_vec(&msg).expect("failed to serialize BridgeMsg");
+
+    let bytes = msg
+        .encode()
+        .expect("Failed to serialize WsTransmitted into items::WsTransmitted");
+
     ws_stream.send(Message::Binary(bytes)).await.unwrap();
 }
 
@@ -559,7 +650,9 @@ where
                 }
             };
 
-            let bytes = bson::to_vec(&bridge_data).expect("failed to serialize bridge data");
+            let bytes = bridge_data
+                .encode()
+                .expect("Failed to serialize WsTransmitted into items::WsTransmitted");
             let msg = Message::Binary(bytes);
             ws_stream
                 .send(msg)
