@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+/* 
+TODO: creare repo per i file proto (ES: message-format) e usarla come git submodule 
+nei progetti per il forwarder (mio e di francesco)
+*/
+
+message Msg {
+    oneof protocol {
+        Http http = 1;
+        // TODO: PingPong -> Possiamo già usare il protocollo WS che prevede messaggi di Ping e Pong.
+        // ES: tungstenite::Message::Ping(<PAYLOAD_Vec<u8>>) 
+    }
+}
+
+/* 
+STEP:
+1. edgehog: apri remote shell (già conosce realm e device_id)
+2. device: connect to ws://<IP:PORT/PATH>_EDGEHOG/<SESSION_SECRET> -> open WS connection
+3. scambio request/response
+*/
+
+// TODO: put in a separate proto file (ES: http_msg.proto)
+message Http {
+    oneof message {
+        StartSession start = 1; 
+        Request request = 2;
+        Response response = 3;
+        CloseSession close = 4;
+    }
+
+    message StartSession {
+        string req_uuid = 1; // lato astarte
+        string realm = 2;
+        string device_id = 3;
+        string session_secret = 4;
+        bool ack = 5;
+    }
+
+    message Request {
+        string req_uuid = 1; // TODO: perchè non usare bytes e decidere la lunghezza in base alla versione di UUID?
+        string path = 2; 
+        string method = 3;
+        optional string querystring = 4;
+        bool chunked = 5; 
+        map<string, string> headers = 6;
+        optional bytes body = 7;
+    }
+
+    message Response {
+        string req_uuid = 1;
+        uint32 status_code = 2;
+        bool chunked = 5; 
+        map<string, string> headers = 6;
+        optional bytes body = 7;
+    }
+
+    message CloseSession {
+        string req_uuid = 1;
+        string realm = 2;
+        string device_id = 3;
+        string session_secret = 4;
+        bool ack = 5;
+    }
+}
+
+// StartSession = Http(Request{
+//     url: http://host?realm=<REALM_ID>&device_id=<DEV_ID>&session_secret=<SESSION_SECRET>
+//     connection-upgrade: websocket,
+// })
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+message Msg2 {
+    oneof protocol {
+        Http2 http = 1;
+    }
+}
+
+message Http2 { 
+    oneof message {
+        HttpRequest request = 1;
+        HttpResponse response = 2;
+    }
+}
+
+message HttpRequest {
+    string req_uuid = 1;
+    string path = 2; 
+    string method = 3;
+    optional string querystring = 4;
+    bool chunked = 5; 
+    map<string, string> headers = 6;
+    optional bytes body = 7;
+}
+
+message HttpResponse {
+    string req_uuid = 1;
+    uint32 status_code = 2; 
+    bool chunked = 5; 
+    map<string, string> headers = 6;
+    optional bytes body = 7;
+}

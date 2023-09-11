@@ -246,3 +246,31 @@ async fn main() -> color_eyre::Result<()> {
 
     Ok(())
 }
+
+async fn main_ping_pong() {
+    let (mut ws, http_res) = connect_async("http://noaccos.ovh:4000/shell/websocket")
+        .await
+        .expect("failed to open websocket");
+
+    debug!(?http_res);
+
+    ws.send(Message::Ping(b"ciao fra".to_vec()))
+        .await
+        .expect("failed to send ping over websocket");
+
+    let res = ws
+        .next()
+        .await
+        .expect("websocket connection closed")
+        .expect("failed to receive from websocket");
+    match res {
+        tokio_tungstenite::tungstenite::Message::Pong(data) => {
+            info!("received pong: {data:?}");
+        }
+        _ => error!("received wrong websocket message type"),
+    }
+
+    ws.close(None).await.expect("failed to close websocket");
+
+    info!("websocket connection closed");
+}
