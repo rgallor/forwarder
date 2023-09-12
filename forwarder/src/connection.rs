@@ -4,6 +4,7 @@ use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use futures_util::SinkExt;
 use prost::Message as ProtoMessage;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::error::SendError;
@@ -14,6 +15,7 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
+use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, instrument, warn};
 use tungstenite::Message;
 
@@ -414,7 +416,7 @@ impl Connections {
                         debug!("new connection received, {id}");
 
                         let ttyd_addr = "127.0.0.1:7681"; // TTYD
-                        let ttdy_stream = match tokio::net::TcpStream::connect(ttyd_addr).await {
+                        let ttdy_stream = match TcpStream::connect(ttyd_addr).await {
                             Ok(stream) => stream,
                             Err(err) => {
                                 error!(?err);
@@ -462,5 +464,53 @@ impl Connections {
         }
 
         Ok(())
+    }
+}
+
+#[instrument(skip_all)]
+pub async fn recv_tcp<T>(data: Option<Transmitted>, ws_stream: &mut WebSocketStream<T>)
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match data {
+        Some(transmitted) => {
+            let (id, msg) = transmitted.into_inner();
+
+            // close the connection if no data is sent
+            let bridge_data = match msg {
+                ConnMsg::Data(data) => {
+                    info!("{}: {} bytes received from TCP connection", id, data.len());
+                    WsTransmitted::new(id, WsMsg::Data(data))
+                }
+                ConnMsg::Eot => {
+                    info!("eot received, closing connection {id}");
+                    WsTransmitted::new(id, WsMsg::Eot)
+                }
+                ConnMsg::Close => {
+                    info!("tcp closed, closing connection {id}");
+                    WsTransmitted::new(id, WsMsg::CloseConnection)
+                }
+            };
+
+            let bytes = bridge_data
+                .encode()
+                .expect("Failed to serialize WsTransmitted into items::WsTransmitted");
+            let msg = Message::Binary(bytes);
+            ws_stream
+                .send(msg)
+                .await
+                .expect("failed to send data on websocket toward device");
+        }
+        // rx hand side of the channel read None, therefore the connection has been closed
+        None => {
+            warn!("rx hand side of the channel read None, all connections have been closed");
+        }
+    }
+}
+
+#[instrument(skip_all)]
+pub async fn recv_ws(msg: Message, connections: &mut Connections) {
+    if let Err(err) = connections.handle_msg(msg).await {
+        error!(?err);
     }
 }

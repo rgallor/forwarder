@@ -509,6 +509,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite",
+ "url",
 ]
 
 [[package]]

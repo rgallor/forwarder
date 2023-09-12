@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 color-eyre = "0.6.2"
 prost = "0.12.0"
 prost-types = "0.12.0"
+url = "2.4.1"
 # pinned transitive dependencies
 time = "=0.3.23"
 

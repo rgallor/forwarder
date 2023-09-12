@@ -35,8 +35,17 @@ fi
 
 prompt "Run bridge?"
 if [ "$p" == "y" ]; then
-    read -rp "Insert listener address: " listener_addr # 0.0.0.0:8080
-    read -rp "Insert browser address: " browser_addr   # 127.0.0.1:9090
+    read -rp "Insert listener address: " listener_addr
+
+    if [ "$listener_addr" == "" ]; then
+        listener_addr="0.0.0.0:8080"
+    fi
+
+    read -rp "Insert browser address: " browser_addr
+
+    if [ "$browser_addr" == "" ]; then
+        browser_addr="127.0.0.1:9090"
+    fi
 
     run "cargo r -p app bridge --listener-addr $listener_addr --browser-addr $browser_addr"
 fi
