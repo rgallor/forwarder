@@ -10,7 +10,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Error as TungError, WebSocket
 use tracing::{info, instrument};
 use tungstenite::Message;
 
-use crate::connection::{recv_tcp, recv_ws, Connections, Id, Transmitted, WsMsg, WsTransmitted};
+use crate::connection::{recv_ws, Connections, Id, Transmitted, WsMsg, WsTransmitted};
 
 enum Receive {
     Connection(std::io::Result<(TcpStream, SocketAddr)>),

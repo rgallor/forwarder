@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package edgehog_device_forwarder;
+
+message Http {
+    oneof message {
+        Request request = 1;
+        Response response = 2;
+    }
+
+    message Request {
+        // unique ID used to match every request with the corresponding response(s)
+        bytes request_id = 1;
+        string path = 2;
+        string method = 3;
+        optional string querystring = 4;
+        map<string, string> headers = 5;
+        optional bytes payload = 6;
+    }
+
+    message Response {
+        bytes request_id = 1;
+        uint32 status_code = 2;
+        map<string, string> headers = 3;
+        optional bytes payload = 4;
+    }
+}

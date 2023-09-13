@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package edgehog_device_forwarder;
+
+message WebSocket {
+    // ID of the websocket connection between ttyd and the device
+    bytes socket_id = 1;
+
+    oneof message {
+        string text = 2;
+        bytes binary = 3;
+        bytes ping = 4;
+        bytes pong = 5;
+        Close close = 6;
+    }
+
+    message Close {
+        uint32 code = 1; // u16
+        optional string reason = 2;
+    }
+}

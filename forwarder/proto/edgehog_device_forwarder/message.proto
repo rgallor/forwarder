@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package edgehog_device_forwarder;
+
+import "edgehog_device_forwarder/http.proto";
+import "edgehog_device_forwarder/ws.proto";
+
+message Message {
+    oneof protocol {
+        Http http = 1;
+        WebSocket ws = 2;
+    }
+}

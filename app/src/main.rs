@@ -1,6 +1,6 @@
-use std::net::SocketAddr;
-
+use backoff::ExponentialBackoff;
 use clap::{Parser, Subcommand};
+use forwarder::proto_message::{ProtoMessage, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 
 use tokio_tungstenite::connect_async;
@@ -17,15 +17,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start a bridge instance
-    Bridge {
-        /// Address the bridge will listen to new connections from devices
-        #[clap(long)]
-        listener_addr: SocketAddr,
-        /// Address the bridge will listen to new connections from the browser
-        #[clap(long)]
-        browser_addr: SocketAddr,
-    },
+    // /// Start a bridge instance
+    // Bridge {
+    //     /// Address the bridge will listen to new connections from devices
+    //     #[clap(long)]
+    //     listener_addr: SocketAddr,
+    //     /// Address the bridge will listen to new connections from the browser
+    //     #[clap(long)]
+    //     browser_addr: SocketAddr,
+    // },
     /// Start a device instance
     Device {
         /// Url of the bridge the device wants to connect with
@@ -52,31 +52,46 @@ async fn main() -> color_eyre::Result<()> {
             // "ws://192.168.122.36:8080"
             debug!(?bridge_url);
             forwarder::device::start(bridge_url).await;
-        }
-        Commands::Bridge {
-            listener_addr,
-            browser_addr,
-        } => {
-            // "0.0.0.0:8080"
-            // "127.0.0.1:9090"
-            debug!(?listener_addr);
-            debug!(?browser_addr);
-            forwarder::bridge::start(listener_addr, browser_addr).await?;
-        }
+        } // Commands::Bridge {
+          //     listener_addr,
+          //     browser_addr,
+          // } => {
+          //     // "0.0.0.0:8080"
+          //     // "127.0.0.1:9090"
+          //     debug!(?listener_addr);
+          //     debug!(?browser_addr);
+          //     forwarder::bridge::start(listener_addr, browser_addr).await?;
+          // }
     }
+
+    // main_ping_pong().await;
 
     Ok(())
 }
 
 #[allow(dead_code)]
 async fn main_ping_pong() {
-    let (mut ws, http_res) = connect_async("http://noaccos.ovh:4000/shell/websocket")
-        .await
-        .expect("failed to open websocket");
+    let (mut ws, http_res) = backoff::future::retry(ExponentialBackoff::default(), || async {
+        println!(
+            "creating websocket connection with {}",
+            "ws://kaiki.local:4000/shell/websocket"
+        );
+        Ok(connect_async("ws://kaiki.local:4000/shell/websocket").await?)
+    })
+    .await
+    .expect("failed to perform exponential backoff1");
 
     debug!(?http_res);
 
-    ws.send(Message::Ping(b"ciao fra".to_vec()))
+    let socket_id = Vec::from("id1");
+    let message = forwarder::proto_message::WebSocketMessage::ping(Vec::from("ciao coglione"));
+    let proto_msg = ProtoMessage::new(forwarder::proto_message::Protocol::WebSocket(
+        WebSocket::new(socket_id, message),
+    ));
+
+    let tung_msg = Message::Binary(proto_msg.encode().expect("failed to encode ProtoMessage"));
+
+    ws.send(tung_msg)
         .await
         .expect("failed to send ping over websocket");
 
@@ -86,8 +101,10 @@ async fn main_ping_pong() {
         .expect("websocket connection closed")
         .expect("failed to receive from websocket");
     match res {
-        tokio_tungstenite::tungstenite::Message::Pong(data) => {
-            info!("received pong: {data:?}");
+        tokio_tungstenite::tungstenite::Message::Binary(data) => {
+            let proto_msg =
+                ProtoMessage::decode(&data).expect("failed to decode into ProtoMessage");
+            info!("received {proto_msg:?}");
         }
         _ => error!("received wrong websocket message type"),
     }

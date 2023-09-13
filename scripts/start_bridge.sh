@@ -37,12 +37,14 @@ prompt "Run bridge?"
 if [ "$p" == "y" ]; then
     read -rp "Insert listener address: " listener_addr
 
+    # default listener address
     if [ "$listener_addr" == "" ]; then
         listener_addr="0.0.0.0:8080"
     fi
 
     read -rp "Insert browser address: " browser_addr
 
+    # default browser address
     if [ "$browser_addr" == "" ]; then
         browser_addr="127.0.0.1:9090"
     fi
