@@ -1,20 +1,26 @@
-use std::hash::Hash;
-
 use backoff::ExponentialBackoff;
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::{timeout, Duration};
-use tokio::{select, sync::mpsc::UnboundedReceiver};
+use displaydoc::Display;
+use thiserror::Error;
+use tokio::time::Duration;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as TungError;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
-use tokio_tungstenite::{connect_async, WebSocketStream};
 use tracing::{debug, error};
 use url::Url;
 
-use crate::connection::{recv_ws, Connections};
-use crate::proto_message::ProtoMessage;
+use crate::connection::ConnectionError;
+use crate::connection::{Connections, WebSocketOperation};
 
-pub async fn start(mut bridge_url: Url) {
+#[non_exhaustive]
+#[derive(Display, Error, Debug)]
+pub enum DeviceError {
+    /// Error performing exponential backoff when trying to connect with Edgehog, {0}
+    WebSocketConnect(#[source] TungError),
+    /// Connection errors
+    Connection(#[from] ConnectionError),
+}
+
+pub async fn start(mut bridge_url: Url) -> Result<(), DeviceError> {
     println!("\nDEVICE\n");
 
     // The device will receive from Astarte the session_token, the url of the edgehog-device-forwarder and other information to properely establish a ws connection
@@ -35,23 +41,23 @@ pub async fn start(mut bridge_url: Url) {
         Ok(connect_async(&bridge_url).await?)
     })
     .await
-    .expect("failed to perform exponential backoff1");
+    .map_err(|err| DeviceError::WebSocketConnect(err))?;
 
     debug!(?http_res);
 
-    let (mut session, mut rx_ws) = Session::new(session_token, ws_stream);
+    let (mut connections, mut rx_ws) = Connections::new(session_token, ws_stream);
 
     // sessions.insert(Session::new(session_secret, ws_stream));
 
     loop {
-        let op = session
+        let op = connections
             .select_ws_op(&mut rx_ws, Duration::from_secs(5))
             .await;
 
         match op {
             // receive from edgehog
             WebSocketOperation::Receive(msg) => match msg {
-                Some(Ok(msg)) => recv_ws(msg, &mut session.connections).await,
+                Some(Ok(msg)) => connections.handle_msg(msg).await?,
                 Some(Err(err)) => error!(?err),
                 None => {
                     error!("stream closed");
@@ -66,78 +72,17 @@ pub async fn start(mut bridge_url: Url) {
                     .expect("failed to encode ProtoMessage");
                 let msg = TungMessage::Binary(msg);
 
-                session
-                    .ws_stream
-                    .send(msg)
-                    .await
-                    .expect("failed to send data on websocket toward device");
+                connections.send(msg).await?
             }
             // in case no data is received in Xs over ws, send a ping.
             // if no pong is received withn Y seconds, close the connection gracefully
-            WebSocketOperation::Ping => todo!(),
-        }
-    }
-}
+            WebSocketOperation::Ping => {
+                let msg = TungMessage::Ping(Vec::new());
 
-enum WebSocketOperation {
-    Receive(Option<Result<TungMessage, TungError>>),
-    Send(Option<ProtoMessage>),
-    Ping,
-}
-
-#[derive(Debug)]
-pub struct Session<T> {
-    session_token: String,
-    ws_stream: WebSocketStream<T>,
-    connections: Connections,
-}
-
-impl<T> Hash for Session<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.session_token.hash(state);
-    }
-}
-
-impl<T> PartialEq for Session<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.session_token == other.session_token
-    }
-}
-
-impl<T> Eq for Session<T> {}
-
-impl<T> Session<T> {
-    pub fn new(
-        session_secret: String,
-        ws_stream: WebSocketStream<T>,
-    ) -> (Self, UnboundedReceiver<ProtoMessage>) {
-        let (connections, rx_ws) = Connections::new();
-
-        let session = Self {
-            session_token: session_secret,
-            ws_stream,
-            connections,
-        };
-
-        (session, rx_ws)
-    }
-
-    async fn select_ws_op(
-        &mut self,
-        rx_ws: &mut UnboundedReceiver<ProtoMessage>,
-        timeout_ping: Duration,
-    ) -> WebSocketOperation
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        select! {
-            res = timeout(timeout_ping, self.ws_stream.next()) => {
-                match res {
-                    Ok(msg) => WebSocketOperation::Receive(msg),
-                    Err(_) => WebSocketOperation::Ping
-                }
+                connections.send(msg).await?
             }
-            tung_msg = rx_ws.recv() => WebSocketOperation::Send(tung_msg)
         }
     }
+
+    Ok(())
 }

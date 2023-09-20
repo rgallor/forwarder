@@ -1,36 +1,56 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use displaydoc::Display;
 use futures_util::{SinkExt, StreamExt};
-use prost::Message as ProstMessage;
+use thiserror::Error;
+use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinHandle;
+use tokio::time::{timeout, Duration};
 use tokio::{
     net::TcpStream,
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, instrument, warn};
-use tungstenite::Message as TungMessage;
+use tracing::{debug, error, info, instrument, warn};
+use tungstenite::{Error as TungError, Message as TungMessage};
 
 use serde::{Deserialize, Serialize};
 
-use crate::proto::proto;
 use crate::proto_message::{
-    headermap_to_hashmap, Http, HttpResponse, ProtoMessage, WebSocket, WebSocketMessage,
+    headermap_to_hashmap, Http, HttpResponse, ProtoError, ProtoMessage, WebSocket, WebSocketMessage,
 };
+
+pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[non_exhaustive]
+#[derive(Display, Error, Debug)]
+pub enum ConnectionError {
+    /// Error when sending message over websockwet connection, `{0}`.
+    WebSocketSend(#[from] TungError),
+    /// Error when receiving message over websockwet connection, `{0}`.
+    WebSocketNext(#[source] TungError),
+    /// Protobuf error.
+    Protobuf(#[from] ProtoError),
+    /// Channel error
+    ChannelToWs(#[from] SendError<ProtoMessage>),
+    /// Channel error
+    ChannelToTtyd(#[from] SendError<WebSocketMessage>),
+    /// Reqwest error, `{0}`.
+    Reqwest(#[from] reqwest::Error),
+}
 
 #[derive(Debug)]
 struct ConnectionHandle {
-    handle: JoinHandle<()>,
+    handle: JoinHandle<Result<(), ConnectionError>>,
     tx_con: UnboundedSender<WebSocketMessage>,
 }
 
 impl Deref for ConnectionHandle {
-    type Target = JoinHandle<()>;
+    type Target = JoinHandle<Result<(), ConnectionError>>;
 
     fn deref(&self) -> &Self::Target {
         &self.handle
@@ -162,7 +182,7 @@ enum Either {
 #[derive(Debug)]
 struct Connection {
     id: Vec<u8>,
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    stream: WsStream,
     state: ConnState,
     tx_ws: UnboundedSender<ProtoMessage>,
     rx_con: UnboundedReceiver<WebSocketMessage>,
@@ -171,7 +191,7 @@ struct Connection {
 impl Connection {
     fn new(
         id: &[u8],
-        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        stream: WsStream,
         tx_ws: UnboundedSender<ProtoMessage>,
         rx_con: UnboundedReceiver<WebSocketMessage>,
     ) -> Self {
@@ -190,60 +210,75 @@ impl Connection {
         ConnectionHandle { handle, tx_con }
     }
 
-    async fn task(mut self) {
-        if let Err(err) = self.task_loop().await {
+    async fn task(mut self) -> Result<(), ConnectionError> {
+        self.task_loop().await.map_err(|err| {
             error!("error while reading/writing, {err}");
-        }
 
-        let msg = ProtoMessage::new(crate::proto_message::Protocol::WebSocket(WebSocket::close(
-            self.id, None,
-        )));
+            let msg = ProtoMessage::new(crate::proto_message::Protocol::WebSocket(
+                WebSocket::close(self.id, None),
+            ));
 
-        self.tx_ws
-            .send(msg)
-            .expect("failed to send over tx_ws channel");
+            self.tx_ws
+                .send(msg)
+                .expect("failed to send over tx_ws channel");
+
+            err
+        })
     }
 
     #[instrument(skip_all)]
-    async fn task_loop(&mut self) -> io::Result<()> {
+    async fn task_loop(&mut self) -> Result<(), ConnectionError> {
         // select return None if the connection state is Closed
-        while let Some(r_w) = self.select().await {
-            match r_w {
-                Either::Read(data) => self.handle_ws_read(data),
-                Either::Write(opt) => self.handle_ws_write(opt).await,
+        loop {
+            let res = self.select().await;
+
+            match res {
+                Some(Ok(r_w)) => match r_w {
+                    Either::Read(data) => self.handle_ws_read(data)?,
+                    Either::Write(opt) => self.handle_ws_write(opt).await?,
+                },
+                Some(Err(err)) => error!(?err), // TODO: check if closing the connection or only reporting the error
+                None => {
+                    info!("connection state Closed, exiting...");
+                    return Ok(());
+                }
             }
         }
-
-        info!("connection state Closed, exiting...");
-
-        Ok(())
     }
 
-    async fn select(&mut self) -> Option<Either> {
+    async fn select(&mut self) -> Option<Result<Either, ConnectionError>> {
         match self.state {
-            ConnState::ReadWrite => Some(select! {
-                res = self.stream.next() => {
-                    let tung_msg = res.expect("next returned None, websocket stream closed").expect("error while reading from websocket");
-                    Either::Read(tung_msg)
-                }
-                // TODO: modify Write enum type
-                opt = self.rx_con.recv() => Either::Write(opt),
-            }),
-            ConnState::Read => Some(Either::Read(
-                self.stream
-                    .next()
-                    .await
-                    .expect("next returned None, websocket stream closed")
-                    .expect("error while reading from websocket"),
-            )),
-            ConnState::Write => Some(Either::Write(self.rx_con.recv().await)),
+            ConnState::ReadWrite => select! {
+                res = Connection::stream_next(&mut self.stream) => res,
+                opt = Connection::channel_recv(&mut self.rx_con) => opt,
+            },
+            ConnState::Read => Connection::stream_next(&mut self.stream).await,
+            ConnState::Write => Connection::channel_recv(&mut self.rx_con).await,
             ConnState::Closed => None,
         }
     }
 
-    /// Read from tcp.
+    async fn stream_next(stream: &mut WsStream) -> Option<Result<Either, ConnectionError>> {
+        match stream.next().await {
+            Some(Ok(tung_msg)) => Some(Ok(Either::Read(tung_msg))),
+            Some(Err(err)) => Some(Err(ConnectionError::WebSocketNext(err))),
+            None => {
+                warn!("next returned None, websocket stream closed");
+                // return None so that the main task_loop ends.
+                None
+            }
+        }
+    }
+
+    async fn channel_recv(
+        rx_con: &mut UnboundedReceiver<WebSocketMessage>,
+    ) -> Option<Result<Either, ConnectionError>> {
+        Some(Ok(Either::Write(rx_con.recv().await)))
+    }
+
+    /// Read from websocket.
     #[instrument(skip(self), fields(state = %self.state))]
-    fn handle_ws_read(&mut self, data: TungMessage) {
+    fn handle_ws_read(&mut self, data: TungMessage) -> Result<(), ConnectionError> {
         // let msg = bytes.map(|bytes| {
         //     info!("received {bytes} bytes");
         //     let id = self.id.clone();
@@ -265,41 +300,38 @@ impl Connection {
             self.state.shutdown_read();
         }
 
-        let msg =
-            ProtoMessage::try_from(data).expect("failed to convert TungMessage into ProtoMessage");
+        let msg = ProtoMessage::try_from(data)?;
 
-        self.tx_ws
-            .send(msg)
-            .expect("error while sending on channel");
+        self.tx_ws.send(msg).map_err(|err| err.into())
     }
 
-    /// Write to tcp.
+    /// Write to websocket.
     #[instrument(skip_all, fields(state = %self.state))]
-    async fn handle_ws_write(&mut self, data: Option<WebSocketMessage>) {
+    async fn handle_ws_write(
+        &mut self,
+        data: Option<WebSocketMessage>,
+    ) -> Result<(), ConnectionError> {
         let data = match data {
             None => {
                 error!("rx_con channel dropped, changing write state to avoid receiving other data from the channel");
 
                 self.state.shutdown_write();
-                info!("changed write state after channel closure");
+                debug!("changed write state after channel closure");
 
                 // return after changing the state. in this way it will not be possible to write data anymore
-                return;
+                return Ok(());
             }
             Some(msg) => msg,
         };
 
-        // TODO: this if condition should never occur
+        // TODO: this condition should never occur
         if !self.state.can_write() {
             warn!("not allowed to write");
-            return;
+            return Ok(());
         }
 
         let tung_msg = data.into();
-        self.stream
-            .send(tung_msg)
-            .await
-            .expect("failed to send TungMessage to ttyd");
+        self.stream.send(tung_msg).await.map_err(|err| err.into())
 
         // match data {
         //     ConnMsg::Data(data) if data.is_empty() => {
@@ -342,68 +374,82 @@ impl Connection {
     // }
 }
 
-#[derive(Debug)]
-pub struct WsTransmitted {
-    id: Id,
-    msg: WsMsg,
-}
+// #[derive(Debug)]
+// pub struct WsTransmitted {
+//     id: Id,
+//     msg: WsMsg,
+// }
 
-impl WsTransmitted {
-    pub fn new(id: Id, msg: WsMsg) -> Self {
-        Self { id, msg }
-    }
+// impl WsTransmitted {
+//     pub fn new(id: Id, msg: WsMsg) -> Self {
+//         Self { id, msg }
+//     }
 
-    pub fn encode(self) -> Result<Vec<u8>, ()> {
-        let mut id = proto::Id::default();
-        id.port = self.id.port.into();
-        id.host = self.id.host.to_string(); //.expect("failed to remove String from Arc");
+//     pub fn encode(self) -> Result<Vec<u8>, ConnectionError> {
+//         let mut id = proto::Id::default();
+//         id.port = self.id.port.into();
+//         id.host = self.id.host.to_string();
 
-        let mut msg = proto::WsMsg::default();
-        msg.ws_msg_type = Some(self.msg.into());
+//         let mut msg = proto::WsMsg::default();
+//         msg.ws_msg_type = Some(self.msg.into());
 
-        let mut transmitted_msg = proto::WsTransmitted::default();
-        transmitted_msg.id = Some(id);
-        transmitted_msg.msg = Some(msg);
+//         let mut transmitted_msg = proto::WsTransmitted::default();
+//         transmitted_msg.id = Some(id);
+//         transmitted_msg.msg = Some(msg);
 
-        let mut buf = Vec::new();
-        let buf_size = transmitted_msg.encoded_len();
-        buf.reserve(buf_size);
+//         let mut buf = Vec::new();
+//         let buf_size = transmitted_msg.encoded_len();
+//         buf.reserve(buf_size);
 
-        transmitted_msg
-            .encode(&mut buf)
-            .expect("failed to serialize WsTransmitted");
+//         transmitted_msg
+//             .encode(&mut buf)
+//             .expect("failed to serialize WsTransmitted");
 
-        Ok(buf)
-    }
+//         Ok(buf)
+//     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, ()> {
-        let msg_transmitted = proto::WsTransmitted::decode(bytes).map_err(|_| ())?;
-        WsTransmitted::try_from(msg_transmitted)
-    }
-}
+//     pub fn decode(bytes: &[u8]) -> Result<Self, ()> {
+//         let msg_transmitted = proto::WsTransmitted::decode(bytes).map_err(|_| ())?;
+//         WsTransmitted::try_from(msg_transmitted)
+//     }
+// }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum WsMsg {
-    NewConnection,
-    Eot,
-    CloseConnection,
-    Data(Vec<u8>),
+// #[derive(Serialize, Deserialize, Debug)]
+// pub enum WsMsg {
+//     NewConnection,
+//     Eot,
+//     CloseConnection,
+//     Data(Vec<u8>),
+// }
+
+pub enum WebSocketOperation {
+    Receive(Option<Result<TungMessage, TungError>>),
+    Send(Option<ProtoMessage>),
+    Ping,
 }
 
 #[derive(Debug)]
 pub struct Connections {
+    // TODO: USARE IL SESSION TOKEN PER EFFETTUARE UNA RECONNECT
+    session_token: String,
+    ws_stream: WsStream,
     connections: HashMap<Vec<u8>, ConnectionHandle>,
     tx_ws: UnboundedSender<ProtoMessage>,
 }
 
 impl Connections {
-    pub fn new() -> (Self, UnboundedReceiver<ProtoMessage>) {
+    pub fn new(
+        session_token: String,
+        ws_stream: WsStream,
+    ) -> (Self, UnboundedReceiver<ProtoMessage>) {
         // this channel is used by tasks associated to each connection to communicate new
         // information available on a given tcp reader handle (associated to an u16 connection ID).
         // it is also used to forward the incoming data to the device over the websocket connection
         let (tx_ws, rx_ws) = mpsc::unbounded_channel();
 
         let connections = Self {
+            session_token,
+            ws_stream,
             connections: HashMap::new(),
             tx_ws,
         };
@@ -412,11 +458,7 @@ impl Connections {
     }
 
     // insertion of a new connection given a tcp_stream
-    pub async fn add_connection(
-        &mut self,
-        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-        id: &[u8],
-    ) {
+    pub async fn add_connection(&mut self, stream: WsStream, id: &[u8]) {
         let (tx_con, rx_con) = mpsc::unbounded_channel();
 
         let tx_ws = self.tx_ws.clone();
@@ -434,17 +476,42 @@ impl Connections {
         self.connections.get_mut(id)
     }
 
+    pub async fn select_ws_op(
+        &mut self,
+        rx_ws: &mut UnboundedReceiver<ProtoMessage>,
+        timeout_ping: Duration,
+    ) -> WebSocketOperation {
+        select! {
+            res = timeout(timeout_ping, self.ws_stream.next()) => {
+                match res {
+                    Ok(msg) => WebSocketOperation::Receive(msg),
+                    Err(_) => WebSocketOperation::Ping
+                }
+            }
+            tung_msg = rx_ws.recv() => WebSocketOperation::Send(tung_msg)
+        }
+    }
+
+    pub async fn send(&mut self, tung_msg: TungMessage) -> Result<(), ConnectionError> {
+        self.ws_stream
+            .send(tung_msg)
+            .await
+            .map_err(|err| err.into())
+    }
+
     #[instrument(skip_all)]
-    pub async fn handle_msg(&mut self, msg: TungMessage) -> Result<(), ()> {
+    pub async fn handle_msg(&mut self, msg: TungMessage) -> Result<(), ConnectionError> {
         match msg {
             // TODO: handle other types of messages
-            TungMessage::Ping(_) => todo!("handle Ping from edgehog"),
-            TungMessage::Pong(_) => todo!("handle Pong from edgehog"),
+            TungMessage::Ping(data) => {
+                let msg = TungMessage::Pong(data);
+
+                self.send(msg).await?;
+            }
+            TungMessage::Pong(_) => debug!("received Pong frame from edgeho"),
             TungMessage::Close(_) => todo!("handle Close from edgehog"),
             TungMessage::Binary(bytes) => {
-                let protocol = ProtoMessage::decode(&bytes)
-                    .expect("failed to deserialize from bytes to WsTransmitted")
-                    .protocol();
+                let protocol = ProtoMessage::decode(&bytes)?.protocol();
 
                 match protocol {
                     crate::proto_message::Protocol::Http(Http::Response(http_res)) => {
@@ -455,10 +522,7 @@ impl Connections {
                     }
                     crate::proto_message::Protocol::Http(Http::Request(http_req)) => {
                         if http_req.is_connection_upgrade() {
-                            let (request_id, ws_stream_ttyd, res) = http_req
-                                .upgrade()
-                                .await
-                                .expect("failed to upgrade http request");
+                            let (request_id, ws_stream_ttyd, res) = http_req.upgrade().await?;
 
                             // store the new WebSocketStream inside Connections struct
                             // use as ID of the connection the ID of the HTTP request/response
@@ -474,9 +538,7 @@ impl Connections {
                                 Http::Response(proto_res),
                             ));
 
-                            self.tx_ws
-                                .send(msg)
-                                .expect("failed to send TungMessage over tx_ws channel");
+                            self.tx_ws.send(msg)?;
                         } else {
                             let (request_id, mut res) = http_req.send().await?;
 
@@ -484,9 +546,7 @@ impl Connections {
                             let headers = headermap_to_hashmap(res.headers().iter());
 
                             // for every received chunk of bytes
-                            while let Some(payload) =
-                                res.chunk().await.expect("failed to await chunks")
-                            {
+                            while let Some(payload) = res.chunk().await? {
                                 let proto_res = HttpResponse::new(
                                     &request_id,
                                     status_code,
@@ -498,9 +558,7 @@ impl Connections {
                                     Http::Response(proto_res),
                                 ));
 
-                                self.tx_ws
-                                    .send(msg)
-                                    .expect("failed to send TungMessage over tx_ws channel");
+                                self.tx_ws.send(msg)?;
                             }
                         }
                     }
@@ -509,10 +567,7 @@ impl Connections {
                         // using the socket_id to identify which ws channel must be used
                         let (id, ws_msg) = ws.into_inner();
                         match self.get_connection(&id) {
-                            Some(connection) => connection
-                                .tx_con
-                                .send(ws_msg)
-                                .expect("failed to send WebSocketMessage over tx_con channel"),
+                            Some(connection) => connection.tx_con.send(ws_msg)?,
                             None => {
                                 error!("connection {id:?} not found, discarding data");
                                 return Ok(());
@@ -631,10 +686,3 @@ impl Connections {
 //         }
 //     }
 // }
-
-#[instrument(skip_all)]
-pub async fn recv_ws(msg: TungMessage, connections: &mut Connections) {
-    if let Err(err) = connections.handle_msg(msg).await {
-        error!(?err);
-    }
-}

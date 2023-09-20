@@ -1,14 +1,43 @@
 use std::{collections::HashMap, str::FromStr};
 
+use displaydoc::Display;
 use prost::Message as ProstMessage;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Client as ReqwClient, Response as ReqwResponse,
 };
+use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::error;
+use tungstenite::Error as TungError;
+use url::ParseError;
+
+#[derive(Display, Error, Debug)]
+#[non_exhaustive]
+pub enum ProtoError {
+    /// Failed to deserialize fropm Protobuf, `{0}`.
+    Decode(#[from] prost::DecodeError),
+    /// Failed to serialize into Protobuf, `{0}`.
+    Encode(#[from] prost::EncodeError),
+    /// Received a wrong WebSocket frame.
+    WrongWsFrame,
+    /// Empty WebSocket message field.
+    EmptyWsMessage,
+    /// Empty HTTP message field.
+    EmptyHttpMessage,
+    /// Wrong HTTP method field.
+    WrongHttpMethod(String),
+    /// Http error, `{0}`.
+    Http(#[from] tungstenite::http::Error),
+    /// Reqwest error, `{0}`.
+    Reqwest(#[from] reqwest::Error),
+    /// Error parsing URL, `{0}`.
+    ParseUrl(#[from] ParseError),
+    /// Error performing exponential backoff when trying to connect with TTYD, {0}
+    WebSocketConnect(#[from] TungError),
+}
 
 #[derive(Debug)]
 pub struct ProtoMessage {
@@ -24,7 +53,7 @@ impl ProtoMessage {
         self.protocol
     }
 
-    pub fn encode(self) -> Result<Vec<u8>, ()> {
+    pub fn encode(self) -> Result<Vec<u8>, ProtoError> {
         let protocol = match self.protocol {
             Protocol::Http(Http::Request(http_req)) => {
                 let mut proto_req = proto::http::Request::default();
@@ -79,25 +108,14 @@ impl ProtoMessage {
         let buf_size = msg.encoded_len();
         buf.reserve(buf_size);
 
-        msg.encode(&mut buf).expect("failed to serialize Message");
+        msg.encode(&mut buf)?;
 
         Ok(buf)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, ()> {
-        let msg = proto::Message::decode(bytes).map_err(|_| ())?;
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        let msg = proto::Message::decode(bytes).map_err(|err| ProtoError::from(err))?;
         ProtoMessage::try_from(msg)
-    }
-}
-
-impl TryFrom<TungMessage> for ProtoMessage {
-    type Error = (); // SHOULD BE TUNGSTENITE ERROR
-
-    fn try_from(tung_msg: TungMessage) -> Result<Self, Self::Error> {
-        Ok(Self::new(Protocol::WebSocket(WebSocket {
-            socket_id: Vec::new(),
-            message: WebSocketMessage::try_from(tung_msg)?,
-        })))
     }
 }
 
@@ -128,15 +146,12 @@ impl HttpRequest {
         self.headers.contains_key("Upgrade")
     }
 
-    pub async fn send(self) -> Result<(Vec<u8>, ReqwResponse), ()> {
+    pub async fn send(self) -> Result<(Vec<u8>, ReqwResponse), ProtoError> {
         // TODO: the request could be created when deserializing the message coming from edgehog
         let query_params = self.querystring.map_or(String::from(""), |q| q);
 
         let url_str = String::from("http://localhost:7681/") + &self.path + &query_params;
-        let url = url::Url::parse(&url_str).map_err(|err| {
-            error!("failed to parse url_str into Url, {:?}", err);
-            ()
-        })?;
+        let url = url::Url::parse(&url_str)?;
 
         // TODO: verify that try_from cannot be used to convert HashMap into HeaderMap
         let headers = hashmap_to_headermap(self.headers.iter());
@@ -153,19 +168,11 @@ impl HttpRequest {
             "PUT" => ReqwClient::new().put(url),
             wrong_method => {
                 error!("wrong method received, {}", wrong_method);
-                return Err(());
+                return Err(ProtoError::WrongHttpMethod(wrong_method.to_string()));
             }
         };
 
-        let http_res = reqw_client
-            .headers(headers)
-            .body(payload)
-            .send()
-            .await
-            .map_err(|err| {
-                error!(?err);
-                ()
-            })?;
+        let http_res = reqw_client.headers(headers).body(payload).send().await?;
 
         Ok((self.request_id, http_res))
     }
@@ -178,17 +185,13 @@ impl HttpRequest {
             WebSocketStream<MaybeTlsStream<TcpStream>>,
             tungstenite::http::Response<Option<Vec<u8>>>,
         ),
-        (),
+        ProtoError,
     > {
         // TODO: the request could be created when deserializing the message coming from edgehog
         let query_params = self.querystring.map_or(String::from(""), |q| q);
 
         // TODO: WSS schema ?
         let url = String::from("ws://localhost:7681/") + &self.path + &query_params;
-        // let url = url::Url::parse(&url_str).map_err(|err| {
-        //     error!("failed to parse url_str into Url, {:?}", err);
-        //     ()
-        // })?;
 
         let req = match self.method.to_ascii_uppercase().as_str() {
             "GET" => tungstenite::http::Request::get(url),
@@ -199,7 +202,7 @@ impl HttpRequest {
             "PUT" => tungstenite::http::Request::put(url),
             wrong_method => {
                 error!("wrong method received, {}", wrong_method);
-                return Err(());
+                return Err(ProtoError::WrongHttpMethod(wrong_method.to_string()));
             }
         };
 
@@ -213,14 +216,9 @@ impl HttpRequest {
                 });
 
         // TODO: no payload canbe used because tokio_tungstenite wants Request<()>
-        // let payload = self.payload.unwrap_or(Vec::new());
+        let req = req.body(())?;
 
-        let req = req.body(()).expect("failed to build request");
-
-        let (ws, res) = tokio_tungstenite::connect_async(req).await.map_err(|err| {
-            error!(?err);
-            ()
-        })?;
+        let (ws, res) = tokio_tungstenite::connect_async(req).await?;
 
         Ok((self.request_id, ws, res))
     }
@@ -338,8 +336,19 @@ impl WebSocketMessage {
     }
 }
 
+impl TryFrom<TungMessage> for ProtoMessage {
+    type Error = ProtoError;
+
+    fn try_from(tung_msg: TungMessage) -> Result<Self, Self::Error> {
+        Ok(Self::new(Protocol::WebSocket(WebSocket {
+            socket_id: Vec::new(),
+            message: WebSocketMessage::try_from(tung_msg)?,
+        })))
+    }
+}
+
 impl TryFrom<TungMessage> for WebSocketMessage {
-    type Error = (); // SHOULD BE TUNGSTENITE ERROR
+    type Error = ProtoError;
 
     fn try_from(tung_msg: TungMessage) -> Result<Self, Self::Error> {
         let msg = match tung_msg {
@@ -348,15 +357,21 @@ impl TryFrom<TungMessage> for WebSocketMessage {
             tungstenite::Message::Ping(data) => WebSocketMessage::ping(data),
             tungstenite::Message::Pong(data) => WebSocketMessage::pong(data),
             tungstenite::Message::Close(data) => {
-                let close_frame = data.expect("error unwrapping websocket close frame");
-                let code = close_frame.code.into();
-                let reason = Some(close_frame.reason.into_owned());
+                // instead of returning an error, here i build a default close frame in case no frame is passed
+                let (code, reason) = match data {
+                    Some(close_frame) => {
+                        let code = close_frame.code.into();
+                        let reason = Some(close_frame.reason.into_owned());
+                        (code, reason)
+                    }
+                    None => (1000, None),
+                };
 
                 WebSocketMessage::close(code, reason)
             }
             tungstenite::Message::Frame(_) => {
                 error!("this kind of message should not be sent");
-                return Err(());
+                return Err(Self::Error::WrongWsFrame);
             }
         };
 
@@ -387,7 +402,7 @@ pub mod proto {
 }
 
 impl TryFrom<proto::Message> for ProtoMessage {
-    type Error = ();
+    type Error = ProtoError;
 
     fn try_from(value: proto::Message) -> Result<Self, Self::Error> {
         let proto::Message { protocol } = value;
@@ -399,7 +414,7 @@ impl TryFrom<proto::Message> for ProtoMessage {
 }
 
 impl TryFrom<proto::message::Protocol> for Protocol {
-    type Error = ();
+    type Error = ProtoError;
 
     fn try_from(value: proto::message::Protocol) -> Result<Self, Self::Error> {
         let protocol = match value {
@@ -410,7 +425,7 @@ impl TryFrom<proto::message::Protocol> for Protocol {
                 message: Some(proto::http::Message::Response(res)),
             }) => Protocol::Http(Http::Response(res.into())),
             proto::message::Protocol::Http(proto::Http { message: None }) => {
-                return Err(());
+                return Err(Self::Error::EmptyHttpMessage);
             }
             proto::message::Protocol::Ws(ws) => Protocol::WebSocket(ws.try_into()?),
         };
@@ -458,12 +473,14 @@ impl From<proto::http::Response> for HttpResponse {
 }
 
 impl TryFrom<proto::WebSocket> for WebSocket {
-    type Error = ();
+    type Error = ProtoError;
 
     fn try_from(value: proto::WebSocket) -> Result<Self, Self::Error> {
         let proto::WebSocket { socket_id, message } = value;
 
-        let Some(msg) = message else { return Err(()) };
+        let Some(msg) = message else {
+            return Err(Self::Error::EmptyWsMessage);
+        };
 
         let message = match msg {
             proto::web_socket::Message::Text(data) => WebSocketMessage::text(data),

@@ -51,7 +51,8 @@ async fn main() -> color_eyre::Result<()> {
         Commands::Device { bridge_url } => {
             // "ws://192.168.122.36:8080"
             debug!(?bridge_url);
-            forwarder::device::start(bridge_url).await;
+            let res = forwarder::device::start(bridge_url).await;
+            debug!(?res)
         } // Commands::Bridge {
           //     listener_addr,
           //     browser_addr,
