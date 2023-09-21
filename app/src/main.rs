@@ -45,27 +45,27 @@ async fn main() -> color_eyre::Result<()> {
         .with(EnvFilter::from_default_env())
         .try_init()?;
 
-    let cli = Cli::parse();
+    // let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Device { bridge_url } => {
-            // "ws://192.168.122.36:8080"
-            debug!(?bridge_url);
-            let res = forwarder::device::start(bridge_url).await;
-            debug!(?res)
-        } // Commands::Bridge {
-          //     listener_addr,
-          //     browser_addr,
-          // } => {
-          //     // "0.0.0.0:8080"
-          //     // "127.0.0.1:9090"
-          //     debug!(?listener_addr);
-          //     debug!(?browser_addr);
-          //     forwarder::bridge::start(listener_addr, browser_addr).await?;
-          // }
-    }
+    // match cli.command {
+    //     Commands::Device { bridge_url } => {
+    //         // "ws://192.168.122.36:8080"
+    //         debug!(?bridge_url);
+    //         let res = forwarder::device::start(bridge_url).await;
+    //         debug!(?res)
+    //     } // Commands::Bridge {
+    //       //     listener_addr,
+    //       //     browser_addr,
+    //       // } => {
+    //       //     // "0.0.0.0:8080"
+    //       //     // "127.0.0.1:9090"
+    //       //     debug!(?listener_addr);
+    //       //     debug!(?browser_addr);
+    //       //     forwarder::bridge::start(listener_addr, browser_addr).await?;
+    //       // }
+    // }
 
-    //ain_ping_pong().await;
+    main_ping_pong().await;
 
     Ok(())
 }
@@ -77,7 +77,7 @@ async fn main_ping_pong() {
             "creating websocket connection with {}",
             "ws://kaiki.local:4000/shell/websocket"
         );
-        Ok(connect_async("ws://kaiki.local:4000/shell/websocket").await?)
+        Ok(connect_async("ws://kaiki.local:4000/device/websocket?session=123cacca456").await?)
     })
     .await
     .expect("failed to perform exponential backoff1");
@@ -107,7 +107,7 @@ async fn main_ping_pong() {
                 ProtoMessage::decode(&data).expect("failed to decode into ProtoMessage");
             info!("received {proto_msg:?}");
         }
-        _ => error!("received wrong websocket message type"),
+        msg => error!("received wrong websocket message type: {msg}"),
     }
 
     ws.close(None).await.expect("failed to close websocket");

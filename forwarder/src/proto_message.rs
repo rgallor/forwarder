@@ -184,16 +184,7 @@ impl HttpRequest {
         Ok((self.request_id, http_res))
     }
 
-    pub async fn upgrade(
-        self,
-    ) -> Result<
-        (
-            Vec<u8>,
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            tungstenite::http::Response<Option<Vec<u8>>>,
-        ),
-        ProtoError,
-    > {
+    pub async fn upgrade(self) -> Result<HttpUpgrade, ProtoError> {
         // TODO: the request could be created when deserializing the message coming from edgehog
         let query_params = self.querystring.map_or(String::from(""), |q| q);
 
@@ -227,7 +218,38 @@ impl HttpRequest {
 
         let (ws, res) = tokio_tungstenite::connect_async(req).await?;
 
-        Ok((self.request_id, ws, res))
+        Ok(HttpUpgrade::new(self.request_id, ws, res))
+    }
+}
+
+#[derive(Debug)]
+pub struct HttpUpgrade {
+    request_id: Vec<u8>,
+    ws_stream_ttyd: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    http_res: tungstenite::http::Response<Option<Vec<u8>>>,
+}
+
+impl HttpUpgrade {
+    pub fn new(
+        request_id: Vec<u8>,
+        ws_stream_ttyd: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        http_res: tungstenite::http::Response<Option<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            request_id,
+            ws_stream_ttyd,
+            http_res,
+        }
+    }
+
+    pub fn into_inner(
+        self,
+    ) -> (
+        Vec<u8>,
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tungstenite::http::Response<Option<Vec<u8>>>,
+    ) {
+        (self.request_id, self.ws_stream_ttyd, self.http_res)
     }
 }
 
