@@ -65,7 +65,7 @@ async fn main() -> color_eyre::Result<()> {
           // }
     }
 
-    // main_ping_pong().await;
+    //ain_ping_pong().await;
 
     Ok(())
 }
@@ -113,4 +113,49 @@ async fn main_ping_pong() {
     ws.close(None).await.expect("failed to close websocket");
 
     info!("websocket connection closed");
+
+    // SEND TEXT FRAME (and open 2 ws connections)
+    /*
+    let tung_msg = Message::Text(String::from("ciao frateme"));
+
+    ws.send(tung_msg)
+        .await
+        .expect("failed to send ping over websocket");
+
+    let (mut ws2, http_res) = backoff::future::retry(ExponentialBackoff::default(), || async {
+        println!(
+            "creating websocket connection with {}",
+            "ws://kaiki.local:4000/shell/websocket"
+        );
+        Ok(connect_async("ws://kaiki.local:4000/shell/websocket").await?)
+    })
+    .await
+    .expect("failed to perform exponential backoff1");
+
+    debug!(?http_res);
+
+    let tung_msg = Message::Text(String::from("ciao frateme 2"));
+
+    ws2.send(tung_msg)
+        .await
+        .expect("failed to send ping over websocket");
+
+    // let res = ws
+    //     .next()
+    //     .await
+    //     .expect("websocket connection closed")
+    //     .expect("failed to receive from websocket");
+    // match res {
+    //     tokio_tungstenite::tungstenite::Message::Text(data) => {
+    //         info!("received {data}");
+    //     }
+    //     _ => error!("received wrong websocket message type"),
+    // }
+
+    ws.close(None).await.expect("failed to close websocket");
+    ws2.close(None).await.expect("failed to close websocket");
+
+    info!("websocket connection closed");
+
+     */
 }

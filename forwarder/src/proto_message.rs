@@ -11,8 +11,15 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::error;
+use tungstenite::http::Request as TungHttpRequest;
 use tungstenite::Error as TungError;
 use url::ParseError;
+
+use proto::http::Message as ProtoHttpMessage;
+use proto::http::Request as ProtoHttpRequest;
+use proto::http::Response as ProtoHttpRespone;
+use proto::message::Protocol as ProtoProtocol;
+use proto::web_socket::Message as ProtoWsMessage;
 
 #[derive(Display, Error, Debug)]
 #[non_exhaustive]
@@ -56,7 +63,7 @@ impl ProtoMessage {
     pub fn encode(self) -> Result<Vec<u8>, ProtoError> {
         let protocol = match self.protocol {
             Protocol::Http(Http::Request(http_req)) => {
-                let mut proto_req = proto::http::Request::default();
+                let mut proto_req = ProtoHttpRequest::default();
                 proto_req.request_id = http_req.request_id;
                 proto_req.path = http_req.path;
                 proto_req.method = http_req.method;
@@ -64,19 +71,19 @@ impl ProtoMessage {
                 proto_req.headers = http_req.headers;
                 proto_req.payload = http_req.payload;
 
-                proto::message::Protocol::Http(proto::Http {
-                    message: Some(proto::http::Message::Request(proto_req)),
+                ProtoProtocol::Http(proto::Http {
+                    message: Some(ProtoHttpMessage::Request(proto_req)),
                 })
             }
             Protocol::Http(Http::Response(http_res)) => {
-                let mut proto_res = proto::http::Response::default();
+                let mut proto_res = ProtoHttpRespone::default();
                 proto_res.request_id = http_res.request_id;
                 proto_res.status_code = http_res.status_code as u32; // conversion from u16 to u32 is safe
                 proto_res.headers = http_res.headers;
                 proto_res.payload = http_res.payload;
 
-                proto::message::Protocol::Http(proto::Http {
-                    message: Some(proto::http::Message::Response(proto_res)),
+                ProtoProtocol::Http(proto::Http {
+                    message: Some(ProtoHttpMessage::Response(proto_res)),
                 })
             }
             Protocol::WebSocket(ws) => {
@@ -84,12 +91,12 @@ impl ProtoMessage {
                 proto_ws.socket_id = ws.socket_id;
 
                 let ws_message = match ws.message {
-                    WebSocketMessage::Text(data) => proto::web_socket::Message::Text(data),
-                    WebSocketMessage::Binary(data) => proto::web_socket::Message::Binary(data),
-                    WebSocketMessage::Ping(data) => proto::web_socket::Message::Ping(data),
-                    WebSocketMessage::Pong(data) => proto::web_socket::Message::Pong(data),
+                    WebSocketMessage::Text(data) => ProtoWsMessage::Text(data),
+                    WebSocketMessage::Binary(data) => ProtoWsMessage::Binary(data),
+                    WebSocketMessage::Ping(data) => ProtoWsMessage::Ping(data),
+                    WebSocketMessage::Pong(data) => ProtoWsMessage::Pong(data),
                     WebSocketMessage::Close { code, reason } => {
-                        proto::web_socket::Message::Close(proto::web_socket::Close {
+                        ProtoWsMessage::Close(proto::web_socket::Close {
                             code: code as u32,
                             reason,
                         })
@@ -97,7 +104,7 @@ impl ProtoMessage {
                 };
                 proto_ws.message = Some(ws_message);
 
-                proto::message::Protocol::Ws(proto_ws)
+                ProtoProtocol::Ws(proto_ws)
             }
         };
 
@@ -194,12 +201,12 @@ impl HttpRequest {
         let url = String::from("ws://localhost:7681/") + &self.path + &query_params;
 
         let req = match self.method.to_ascii_uppercase().as_str() {
-            "GET" => tungstenite::http::Request::get(url),
-            "DELETE" => tungstenite::http::Request::delete(url),
-            "HEAD" => tungstenite::http::Request::head(url),
-            "PATCH" => tungstenite::http::Request::patch(url),
-            "POST" => tungstenite::http::Request::post(url),
-            "PUT" => tungstenite::http::Request::put(url),
+            "GET" => TungHttpRequest::get(url),
+            "DELETE" => TungHttpRequest::delete(url),
+            "HEAD" => TungHttpRequest::head(url),
+            "PATCH" => TungHttpRequest::patch(url),
+            "POST" => TungHttpRequest::post(url),
+            "PUT" => TungHttpRequest::put(url),
             wrong_method => {
                 error!("wrong method received, {}", wrong_method);
                 return Err(ProtoError::WrongHttpMethod(wrong_method.to_string()));
@@ -413,30 +420,30 @@ impl TryFrom<proto::Message> for ProtoMessage {
     }
 }
 
-impl TryFrom<proto::message::Protocol> for Protocol {
+impl TryFrom<ProtoProtocol> for Protocol {
     type Error = ProtoError;
 
-    fn try_from(value: proto::message::Protocol) -> Result<Self, Self::Error> {
+    fn try_from(value: ProtoProtocol) -> Result<Self, Self::Error> {
         let protocol = match value {
-            proto::message::Protocol::Http(proto::Http {
-                message: Some(proto::http::Message::Request(req)),
+            ProtoProtocol::Http(proto::Http {
+                message: Some(ProtoHttpMessage::Request(req)),
             }) => Protocol::Http(Http::Request(req.into())),
-            proto::message::Protocol::Http(proto::Http {
-                message: Some(proto::http::Message::Response(res)),
+            ProtoProtocol::Http(proto::Http {
+                message: Some(ProtoHttpMessage::Response(res)),
             }) => Protocol::Http(Http::Response(res.into())),
-            proto::message::Protocol::Http(proto::Http { message: None }) => {
+            ProtoProtocol::Http(proto::Http { message: None }) => {
                 return Err(Self::Error::EmptyHttpMessage);
             }
-            proto::message::Protocol::Ws(ws) => Protocol::WebSocket(ws.try_into()?),
+            ProtoProtocol::Ws(ws) => Protocol::WebSocket(ws.try_into()?),
         };
 
         Ok(protocol)
     }
 }
 
-impl From<proto::http::Request> for HttpRequest {
-    fn from(value: proto::http::Request) -> Self {
-        let proto::http::Request {
+impl From<ProtoHttpRequest> for HttpRequest {
+    fn from(value: ProtoHttpRequest) -> Self {
+        let ProtoHttpRequest {
             request_id,
             path,
             method,
@@ -455,9 +462,9 @@ impl From<proto::http::Request> for HttpRequest {
     }
 }
 
-impl From<proto::http::Response> for HttpResponse {
-    fn from(value: proto::http::Response) -> Self {
-        let proto::http::Response {
+impl From<ProtoHttpRespone> for HttpResponse {
+    fn from(value: ProtoHttpRespone) -> Self {
+        let ProtoHttpRespone {
             request_id,
             status_code,
             headers,
@@ -483,11 +490,11 @@ impl TryFrom<proto::WebSocket> for WebSocket {
         };
 
         let message = match msg {
-            proto::web_socket::Message::Text(data) => WebSocketMessage::text(data),
-            proto::web_socket::Message::Binary(data) => WebSocketMessage::binary(data),
-            proto::web_socket::Message::Ping(data) => WebSocketMessage::ping(data),
-            proto::web_socket::Message::Pong(data) => WebSocketMessage::pong(data),
-            proto::web_socket::Message::Close(close) => {
+            ProtoWsMessage::Text(data) => WebSocketMessage::text(data),
+            ProtoWsMessage::Binary(data) => WebSocketMessage::binary(data),
+            ProtoWsMessage::Ping(data) => WebSocketMessage::ping(data),
+            ProtoWsMessage::Pong(data) => WebSocketMessage::pong(data),
+            ProtoWsMessage::Close(close) => {
                 WebSocketMessage::close(close.code as u16, close.reason)
             }
         };
