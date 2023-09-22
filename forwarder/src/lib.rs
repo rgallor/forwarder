@@ -1,4 +1,5 @@
 // pub mod bridge;
+pub mod astarte;
 pub mod connection;
 pub mod connections;
 pub mod device;
