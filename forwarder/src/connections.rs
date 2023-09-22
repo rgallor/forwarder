@@ -55,15 +55,15 @@ impl Connections {
     }
 
     // insertion of a new connection given a tcp_stream
-    pub async fn add_connection(&mut self, stream: WsStream, id: &[u8]) {
+    pub async fn add_connection(&mut self, stream: WsStream, id: Vec<u8>) {
         let (tx_con, rx_con) = mpsc::unbounded_channel();
 
         let tx_ws = self.tx_ws.clone();
-        let connection = Connection::new(id, stream, tx_ws, rx_con).spawn(tx_con);
+        let connection = Connection::new(id.clone(), stream, tx_ws, rx_con).spawn(tx_con);
 
         // because the id_count is internally managed, this function should always return Some(id)
         // otherwise it would mean that a new connection with the same ID of an existing one is openned
-        if self.connections.insert(id.to_vec(), connection).is_some() {
+        if self.connections.insert(id, connection).is_some() {
             error!("connection replaced");
         }
     }
@@ -71,6 +71,11 @@ impl Connections {
     #[instrument(skip_all)]
     fn get_connection(&mut self, id: &[u8]) -> Option<&mut ConnectionHandle> {
         self.connections.get_mut(id)
+    }
+
+    #[instrument(skip_all)]
+    fn remove_connection(&mut self, id: &[u8]) -> Option<ConnectionHandle> {
+        self.connections.remove(id)
     }
 
     pub async fn reconnect(&mut self, url: &Url) -> Result<(), ConnectionError> {
@@ -166,7 +171,8 @@ impl Connections {
 
                             // store the new WebSocketStream inside Connections struct
                             // use as ID of the connection the ID of the HTTP request/response
-                            self.add_connection(ws_stream_ttyd, &request_id).await;
+                            self.add_connection(ws_stream_ttyd, request_id.clone())
+                                .await;
 
                             let status_code = res.status().into();
                             let headers = headermap_to_hashmap(res.headers().iter());
@@ -192,6 +198,19 @@ impl Connections {
                     }
                     ProtoProtocol::WebSocket(ws) => {
                         let (id, ws_msg) = ws.into_inner();
+
+                        // check if the message received from edgehog is a Close frame. Close the corresponding connection.
+                        if ws_msg.is_close() {
+                            match self.remove_connection(&id) {
+                                Some(connection) => connection.close(ws_msg).await?,
+                                None => {
+                                    error!("connection {id:?} not found, discarding data");
+                                    return Ok(());
+                                }
+                            }
+                            return Ok(());
+                        }
+
                         match self.get_connection(&id) {
                             Some(connection) => connection.send_channel(ws_msg).await?,
                             None => {

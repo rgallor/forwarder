@@ -363,6 +363,10 @@ impl WebSocketMessage {
     pub fn close(code: u16, reason: Option<String>) -> Self {
         Self::Close { code, reason }
     }
+
+    pub fn is_close(&self) -> bool {
+        matches!(self, WebSocketMessage::Close { code: _, reason: _ })
+    }
 }
 
 impl TryFrom<TungMessage> for ProtoMessage {
@@ -418,7 +422,7 @@ impl From<WebSocketMessage> for TungMessage {
             WebSocketMessage::Close { code, reason } => {
                 TungMessage::Close(Some(tungstenite::protocol::CloseFrame {
                     code: code.into(),
-                    reason: reason.unwrap().into(),
+                    reason: reason.unwrap_or(String::from("")).into(),
                 }))
             }
         }
