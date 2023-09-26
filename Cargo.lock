@@ -95,8 +95,7 @@ dependencies = [
 [[package]]
 name = "astarte-device-sdk"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b84d195b27d0f5d647a27fcdf7b34093e1d7bc4c6c71b755d91f808cc0788fb"
+source = "git+https://github.com/joshuachp/astarte-device-sdk-rust.git?branch=fix-error-bound#41af32bb4a48aa68942aafe462220a9a32c81dc5"
 dependencies = [
  "async-trait",
  "base64 0.21.4",

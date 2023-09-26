@@ -1,0 +1,26 @@
+{
+    "interface_name": "io.edgehog.devicemanager.RemoteShell",
+    "version_major": 0,
+    "version_minor": 1,
+    "type": "datastream",
+    "ownership": "server",
+    "aggregation": "object",
+    "description": "Configuration to open a remote shell from a device to a certain host",
+    "mappings": [
+        {
+            "endpoint": "/shell/host",
+            "type": "string",
+            "description": "Send the IP address or host name the device must connect to"
+        },
+        {
+            "endpoint": "/shell/port",
+            "type": "integer",
+            "description": "Send the host port the device must connect to"
+        },
+        {
+            "endpoint": "/shell/session_token",
+            "type": "string",
+            "description": "Send the session token thanks to which the device can authenticates itself through edgehog"
+        }
+    ]
+}

@@ -25,10 +25,11 @@ backoff = { version = "0.4.0", features = ["tokio"] }
 thiserror = "1.0.48"
 displaydoc = "0.2.4"
 base64 = "0.21.4"
-astarte-device-sdk = "0.6.0"
+astarte-device-sdk = { git = "https://github.com/joshuachp/astarte-device-sdk-rust.git", branch = "fix-error-bound" }
+serde_json = "1.0.107"
+
 # pinned transitive dependencies
 time = "=0.3.23"
-serde_json = "1.0.107"
 
 [build-dependencies]
 prost-build = "0.12.0"
