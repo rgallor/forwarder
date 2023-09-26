@@ -123,7 +123,7 @@ impl Connections {
         request_id: &[u8],
         status_code: u16,
         headers: HashMap<String, String>,
-        payload: Option<Vec<u8>>,
+        payload: Vec<u8>,
     ) -> Result<(), ConnectionError> {
         let proto_res = HttpResponse::new(request_id, status_code, headers, payload);
 
@@ -176,7 +176,7 @@ impl Connections {
 
                             let status_code = res.status().into();
                             let headers = headermap_to_hashmap(res.headers().iter());
-                            let payload = res.into_body();
+                            let payload = res.into_body().map_or(Vec::new(), |p| p);
 
                             self.send_http_res(&request_id, status_code, headers, payload)?;
                         } else {
@@ -191,7 +191,7 @@ impl Connections {
                                     &request_id,
                                     status_code,
                                     headers.clone(),
-                                    Some(payload.into()),
+                                    payload.into(),
                                 )?;
                             }
                         }

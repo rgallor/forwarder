@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, ops::Not, str::FromStr};
 
 use displaydoc::Display;
 use prost::Message as ProstMessage;
@@ -67,9 +67,17 @@ impl ProtoMessage {
                 proto_req.request_id = http_req.request_id;
                 proto_req.path = http_req.path;
                 proto_req.method = http_req.method;
-                proto_req.querystring = http_req.querystring;
+                proto_req.querystring = http_req
+                    .querystring
+                    .is_empty()
+                    .not()
+                    .then_some(http_req.querystring);
                 proto_req.headers = http_req.headers;
-                proto_req.payload = http_req.payload;
+                proto_req.payload = http_req
+                    .payload
+                    .is_empty()
+                    .not()
+                    .then_some(http_req.payload);
 
                 ProtoProtocol::Http(proto::Http {
                     message: Some(ProtoHttpMessage::Request(proto_req)),
@@ -80,7 +88,11 @@ impl ProtoMessage {
                 proto_res.request_id = http_res.request_id;
                 proto_res.status_code = http_res.status_code as u32; // conversion from u16 to u32 is safe
                 proto_res.headers = http_res.headers;
-                proto_res.payload = http_res.payload;
+                proto_res.payload = http_res
+                    .payload
+                    .is_empty()
+                    .not()
+                    .then_some(http_res.payload);
 
                 ProtoProtocol::Http(proto::Http {
                     message: Some(ProtoHttpMessage::Response(proto_res)),
@@ -143,9 +155,10 @@ pub struct HttpRequest {
     request_id: Vec<u8>,
     path: String,
     method: String,
-    querystring: Option<String>,
+    querystring: String,
     headers: HashMap<String, String>,
-    payload: Option<Vec<u8>>,
+    payload: Vec<u8>,
+    port: u16,
 }
 
 impl HttpRequest {
@@ -155,16 +168,14 @@ impl HttpRequest {
 
     pub async fn send(self) -> Result<(Vec<u8>, ReqwResponse), ProtoError> {
         // TODO: the request could be created when deserializing the message coming from edgehog
-        let query_params = self.querystring.map_or(String::from(""), |q| q);
-
-        let url_str = String::from("http://localhost:7681/") + &self.path + &query_params;
+        let url_str = format!(
+            "ws://localhost:{}/{}{}",
+            self.port, self.path, self.querystring
+        );
         let url = url::Url::parse(&url_str)?;
 
         // TODO: verify that try_from cannot be used to convert HashMap into HeaderMap
         let headers = hashmap_to_headermap(self.headers.iter());
-
-        // TODO: chack that is good to set an empty Vec<u8> as payload
-        let payload = self.payload.unwrap_or(Vec::new());
 
         let reqw_client = match self.method.to_ascii_uppercase().as_str() {
             "GET" => ReqwClient::new().get(url),
@@ -179,17 +190,22 @@ impl HttpRequest {
             }
         };
 
-        let http_res = reqw_client.headers(headers).body(payload).send().await?;
+        let http_res = reqw_client
+            .headers(headers)
+            .body(self.payload)
+            .send()
+            .await?;
 
         Ok((self.request_id, http_res))
     }
 
     pub async fn upgrade(self) -> Result<HttpUpgrade, ProtoError> {
         // TODO: the request could be created when deserializing the message coming from edgehog
-        let query_params = self.querystring.map_or(String::from(""), |q| q);
-
         // TODO: WSS schema ?
-        let url = String::from("ws://localhost:7681/") + &self.path + &query_params;
+        let url = format!(
+            "ws://localhost:{}/{}{}",
+            self.port, self.path, self.querystring
+        );
 
         let req = match self.method.to_ascii_uppercase().as_str() {
             "GET" => TungHttpRequest::get(url),
@@ -277,7 +293,7 @@ pub struct HttpResponse {
     request_id: Vec<u8>,
     status_code: u16,
     headers: HashMap<String, String>,
-    payload: Option<Vec<u8>>,
+    payload: Vec<u8>,
 }
 
 impl HttpResponse {
@@ -285,7 +301,7 @@ impl HttpResponse {
         request_id: &[u8],
         status_code: u16,
         headers: HashMap<String, String>,
-        payload: Option<Vec<u8>>,
+        payload: Vec<u8>,
     ) -> Self {
         Self {
             request_id: request_id.to_vec(),
@@ -476,14 +492,16 @@ impl From<ProtoHttpRequest> for HttpRequest {
             querystring,
             headers,
             payload,
+            port,
         } = value;
         Self {
             request_id,
             path,
             method,
-            querystring,
+            querystring: querystring.map_or(String::from(""), |q| q),
             headers,
-            payload,
+            payload: payload.unwrap_or(Vec::new()),
+            port: port as u16,
         }
     }
 }
@@ -500,7 +518,7 @@ impl From<ProtoHttpRespone> for HttpResponse {
             request_id,
             status_code: status_code as u16,
             headers,
-            payload,
+            payload: payload.map_or(Vec::new(), |p| p),
         }
     }
 }
