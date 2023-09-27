@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 use backoff::ExponentialBackoff;
 use futures_util::{SinkExt, StreamExt};
@@ -19,6 +20,57 @@ use crate::proto_message::{headermap_to_hashmap, Http as ProtoHttp, HttpResponse
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Debug)]
+pub struct ConnectionsHandler {
+    connections: Connections,
+    rx_ws: UnboundedReceiver<ProtoMessage>,
+    url: Url,
+}
+
+impl ConnectionsHandler {
+    pub fn new(connections: Connections, rx_ws: UnboundedReceiver<ProtoMessage>, url: Url) -> Self {
+        Self {
+            connections,
+            rx_ws,
+            url,
+        }
+    }
+
+    pub fn get_url(&self) -> Url {
+        self.url.clone()
+    }
+
+    pub async fn select_ws_op(&mut self, timeout_ping: Duration) -> WebSocketOperation {
+        let Self {
+            connections, rx_ws, ..
+        } = self;
+
+        select! {
+            res = timeout(timeout_ping, connections.ws_stream.next()) => {
+                match res {
+                    Ok(msg) => WebSocketOperation::Receive(msg),
+                    Err(_) => WebSocketOperation::Ping
+                }
+            }
+            tung_msg = rx_ws.recv() => WebSocketOperation::Send(tung_msg)
+        }
+    }
+}
+
+impl Deref for ConnectionsHandler {
+    type Target = Connections;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connections
+    }
+}
+
+impl DerefMut for ConnectionsHandler {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connections
+    }
+}
+
 pub enum WebSocketOperation {
     Receive(Option<Result<TungMessage, TungError>>),
     Send(Option<ProtoMessage>),
@@ -35,10 +87,7 @@ pub struct Connections {
 }
 
 impl Connections {
-    pub fn new(
-        session_token: String,
-        ws_stream: WsStream,
-    ) -> (Self, UnboundedReceiver<ProtoMessage>) {
+    pub fn new(session_token: String, ws_stream: WsStream, url: Url) -> ConnectionsHandler {
         // this channel is used by tasks associated to each connection to communicate new
         // information available on a given websocket between the device and TTYD.
         // it is also used to forward the incoming data from TTYD to the device.
@@ -51,7 +100,7 @@ impl Connections {
             tx_ws,
         };
 
-        (connections, rx_ws)
+        ConnectionsHandler::new(connections, rx_ws, url)
     }
 
     // insertion of a new connection given a tcp_stream
@@ -62,7 +111,7 @@ impl Connections {
         let connection = Connection::new(id.clone(), stream, tx_ws, rx_con).spawn(tx_con);
 
         // because the id_count is internally managed, this function should always return Some(id)
-        // otherwise it would mean that a new connection with the same ID of an existing one is openned
+        // otherwise it would mean that a new connection with the same ID of an existing one is opened
         if self.connections.insert(id, connection).is_some() {
             error!("connection replaced");
         }
@@ -78,12 +127,12 @@ impl Connections {
         self.connections.remove(id)
     }
 
-    pub async fn reconnect(&mut self, url: &Url) -> Result<(), ConnectionError> {
+    pub async fn reconnect(&mut self, url: Url) -> Result<(), ConnectionError> {
         // try openning a websocket connection with edgehog using exponential backoff
         let (new_ws_stream, http_res) =
             backoff::future::retry(ExponentialBackoff::default(), || async {
                 println!("trying to reconnect with {}", url);
-                Ok(tokio_tungstenite::connect_async(url).await?)
+                Ok(tokio_tungstenite::connect_async(&url).await?)
             })
             .await
             .map_err(|err| ConnectionError::Reconnect(err))?;
@@ -93,22 +142,6 @@ impl Connections {
         self.ws_stream = new_ws_stream;
 
         Ok(())
-    }
-
-    pub async fn select_ws_op(
-        &mut self,
-        rx_ws: &mut UnboundedReceiver<ProtoMessage>,
-        timeout_ping: Duration,
-    ) -> WebSocketOperation {
-        select! {
-            res = timeout(timeout_ping, self.ws_stream.next()) => {
-                match res {
-                    Ok(msg) => WebSocketOperation::Receive(msg),
-                    Err(_) => WebSocketOperation::Ping
-                }
-            }
-            tung_msg = rx_ws.recv() => WebSocketOperation::Send(tung_msg)
-        }
     }
 
     pub async fn send(&mut self, tung_msg: TungMessage) -> Result<(), ConnectionError> {

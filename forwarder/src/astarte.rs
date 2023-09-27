@@ -9,20 +9,15 @@ use std::{
 };
 
 use astarte_device_sdk::{
+    AstarteAggregate,
     error::Error as AstarteError,
-    options::{AstarteOptions, OptionsError},
-    store::memory::MemoryStore,
+    options::OptionsError,
     types::AstarteType,
-    AstarteAggregate, AstarteDeviceSdk,
 };
 use displaydoc::Display;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc::UnboundedSender;
-use tracing::{error, info, instrument, warn};
+use tracing::instrument;
 use url::Url;
-
-use crate::device::DeviceError;
 
 /// Astarte errors.
 #[non_exhaustive]
@@ -68,15 +63,6 @@ pub enum Error {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
-/// Struct containing the configuration for an Astarte device.
-#[derive(Serialize, Deserialize)]
-pub struct DeviceConfig {
-    realm: String,
-    device_id: String,
-    credentials_secret: String,
-    pairing_url: String,
-}
-
 /// Struct representing the fields of an aggregated object the Astarte server can send to the device.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -88,7 +74,7 @@ pub struct ConnectionInfo {
 impl AstarteAggregate for ConnectionInfo {
     fn astarte_aggregate(
         self,
-    ) -> Result<std::collections::HashMap<String, AstarteType>, AstarteError> {
+    ) -> Result<HashMap<String, AstarteType>, AstarteError> {
         let mut hm = HashMap::new();
         hm.insert("host".to_string(), self.host.to_string().into());
         hm.insert("port".to_string(), AstarteType::Integer(self.port.into()));
@@ -109,43 +95,16 @@ impl TryFrom<ConnectionInfo> for Url {
         };
 
         Url::parse(&format!(
-            "ws://{}:{}?session_token={}",
+            "ws://{}:{}/path?session_token={}",
             ip, value.port, value.session_token
-        ))
-        .map_err(Error::Parse)
+        )).map_err(Error::Parse)
     }
 }
 
-/// Read the device configuration file.
-async fn read_device_config(device_cfg_path: &str) -> Result<DeviceConfig, Error> {
-    let file = tokio::fs::read(device_cfg_path).await?;
-    let file = std::str::from_utf8(&file)?;
 
-    let cfg: DeviceConfig = serde_json::from_str(file).map_err(|_| Error::Serde)?;
-
-    Ok(cfg)
-}
-
-/// Use the device configuration to create a new instance of an Astarte device and connect it to Astarte.
-async fn create_astarte_device(cfg: &DeviceConfig) -> Result<AstarteDeviceSdk<MemoryStore>, Error> {
-    let sdk_options = AstarteOptions::new(
-        &cfg.realm,
-        &cfg.device_id,
-        &cfg.credentials_secret,
-        &cfg.pairing_url,
-    )
-    .interface_directory("./forwarder/forwarder/interfaces")
-    .map_err(Error::AstarteInterface)?
-    .ignore_ssl_errors();
-
-    let device = AstarteDeviceSdk::new(sdk_options).await?;
-
-    Ok(device)
-}
-
-/// Parse an `HashMap` containig pairs (Endpoint, [`AstarteType`]) into an URL.
+/// Parse an `HashMap` containing pairs (Endpoint, [`AstarteType`]) into an URL.
 #[instrument(skip_all)]
-fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
+pub fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
     let host: &AstarteType = map
         .get("host")
         .ok_or_else(|| Error::MissingUrlInfo("Missing host (IP or domain name)".to_string()))?;
@@ -176,42 +135,4 @@ fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
     };
 
     data.try_into()
-}
-
-/// Handle a single Astarte event.
-pub async fn handle_astarte_events(tx_url: UnboundedSender<Url>) -> Result<(), DeviceError> {
-    let dev_config = read_device_config("../device.json").await?;
-    let mut dev = create_astarte_device(&dev_config).await?;
-
-    loop {
-        // Wait for an aggregate datastream containing a host, a port number and a session token
-        match dev.handle_events().await {
-            Ok(data) => {
-                match data.data {
-                    astarte_device_sdk::Aggregation::Object(map) if data.path == "/shell" => {
-                        let url = retrieve_url(&map)?;
-                        info!("received url: {}", url);
-
-                        // send the retrieved URL to the task responsible for the creation of a new connection
-                        tx_url.send(url).expect("failed to send over channel");
-                    }
-                    _ => {
-                        // when an error is returned, tx_url is dropped. This is fundamental because the task
-                        // responsible for handling the connections will stop spawning other connections
-                        // after having received None from the channel
-                        return Err(Error::AstarteWrongAggregation.into());
-                    }
-                }
-            }
-            // If the device get disconnected from Astarte, it will loop untill it is reconnected
-            // TODO: check that the reconnection is effectively performed
-            Err(err @ AstarteError::ConnectionError(_)) => {
-                warn!("Reconnecting after error, {:#?}", err);
-            }
-            Err(err) => {
-                error!("Astarte error: {:?}", err);
-                return Err(Error::AstarteHandleEvent(err).into());
-            }
-        }
-    }
 }

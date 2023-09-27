@@ -1,13 +1,13 @@
 use backoff::ExponentialBackoff;
 use clap::{Parser, Subcommand};
-use forwarder::proto_message::{ProtoMessage, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info};
-use tracing_subscriber::{prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, prelude::*};
 use url::Url;
+
+use forwarder::proto_message::{ProtoMessage, WebSocket};
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -51,7 +51,7 @@ async fn main() -> color_eyre::Result<()> {
     //     Commands::Device { bridge_url } => {
     //         // "ws://192.168.122.36:8080"
     //         debug!(?bridge_url);
-    //         let res = forwarder::device::start(bridge_url).await;
+    //         let res = forwarder::forwarder::start(bridge_url).await;
     //         debug!(?res)
     //     } // Commands::Bridge {
     //       //     listener_addr,
@@ -79,8 +79,8 @@ async fn main_ping_pong() {
         );
         Ok(connect_async("ws://kaiki.local:4000/device/websocket?session=123cacca456").await?)
     })
-    .await
-    .expect("failed to perform exponential backoff1");
+        .await
+        .expect("failed to perform exponential backoff1");
 
     debug!(?http_res);
 

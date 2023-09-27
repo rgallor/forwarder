@@ -17,14 +17,14 @@ use url::ParseError;
 
 use proto::http::Message as ProtoHttpMessage;
 use proto::http::Request as ProtoHttpRequest;
-use proto::http::Response as ProtoHttpRespone;
+use proto::http::Response as ProtoHttpResponse;
 use proto::message::Protocol as ProtoProtocol;
 use proto::web_socket::Message as ProtoWsMessage;
 
 #[derive(Display, Error, Debug)]
 #[non_exhaustive]
 pub enum ProtoError {
-    /// Failed to deserialize fropm Protobuf, `{0}`.
+    /// Failed to deserialize from Protobuf, `{0}`.
     Decode(#[from] prost::DecodeError),
     /// Failed to serialize into Protobuf, `{0}`.
     Encode(#[from] prost::EncodeError),
@@ -84,7 +84,7 @@ impl ProtoMessage {
                 })
             }
             Protocol::Http(Http::Response(http_res)) => {
-                let mut proto_res = ProtoHttpRespone::default();
+                let mut proto_res = ProtoHttpResponse::default();
                 proto_res.request_id = http_res.request_id;
                 proto_res.status_code = http_res.status_code as u32; // conversion from u16 to u32 is safe
                 proto_res.headers = http_res.headers;
@@ -229,7 +229,7 @@ impl HttpRequest {
                     None => req,
                 });
 
-        // TODO: no payload canbe used because tokio_tungstenite wants Request<()>
+        // TODO: no payload can be used because tokio_tungstenite wants Request<()>
         let req = req.body(())?;
 
         let (ws, res) = tokio_tungstenite::connect_async(req).await?;
@@ -506,9 +506,9 @@ impl From<ProtoHttpRequest> for HttpRequest {
     }
 }
 
-impl From<ProtoHttpRespone> for HttpResponse {
-    fn from(value: ProtoHttpRespone) -> Self {
-        let ProtoHttpRespone {
+impl From<ProtoHttpResponse> for HttpResponse {
+    fn from(value: ProtoHttpResponse) -> Self {
+        let ProtoHttpResponse {
             request_id,
             status_code,
             headers,

@@ -1,24 +1,26 @@
+use std::time::Duration;
+
 use backoff::ExponentialBackoff;
 use displaydoc::Display;
-use thiserror::Error;
-use tokio::time::Duration;
+use thiserror::Error as ThisError;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as TungError;
-use tokio_tungstenite::tungstenite::Message as TungMessage;
-use tracing::{debug, error};
+use tracing::{debug, error, info, instrument};
+use tungstenite::Message as TungMessage;
 use url::Url;
 
-use crate::astarte::{handle_astarte_events, Error as AstarteError};
+use crate::astarte::{ConnectionInfo, Error as AstarteError};
 use crate::connection::ConnectionError;
-use crate::connections::Connections;
-use crate::connections::WebSocketOperation;
+use crate::connections::{Connections, ConnectionsHandler, WebSocketOperation};
 use crate::proto_message::ProtoError;
 
 #[non_exhaustive]
-#[derive(Display, Error, Debug)]
-pub enum DeviceError {
+#[derive(Display, ThisError, Debug)]
+pub enum Error {
     /// Error performing exponential backoff when trying to connect with Edgehog, `{0}`.
     WebSocketConnect(#[from] TungError),
+    /// Trying to perform an operation over a non-existing connection
+    NonExistingConnection,
     /// Connection errors, `{0}`.
     Connection(#[from] ConnectionError),
     /// Protobuf error, `{0}`.
@@ -27,41 +29,73 @@ pub enum DeviceError {
     Astarte(#[from] AstarteError),
 }
 
-pub async fn start() -> Result<(), DeviceError> {
-    println!("\nDEVICE STARTED\n");
+#[derive(Debug, Default)]
+pub enum ForwarderState {
+    #[default]
+    Waiting,
+    Connected(Url),
+}
 
-    // The device receives from Astarte the url of the edgehog-device-forwarder and other information to properely establish a ws connection with it
-    // -> Es://<IP:PORT>/<PATH>?session_secret=<SESSION_SECRET>
-    let (tx_url, mut rx_url) = tokio::sync::mpsc::unbounded_channel::<Url>();
+#[derive(Debug, Default)]
+pub struct Forwarder {
+    state: ForwarderState,
+    connections: Option<ConnectionsHandler>,
+}
 
-    // define a task to handle astarte events and send the received URL to the task responsible for the creation of new connections
-    let handle_astarte = tokio::spawn(handle_astarte_events(tx_url));
+impl Forwarder {
+    /// Check if the device has already established a WebSocekt connection with edgehog
+    fn is_connected(&self) -> bool {
+        match self.state {
+            ForwarderState::Connected(_) => true,
+            _ => false,
+        }
+    }
 
-    // TODO: at the moment only 1 connection at a time is handled. Spawn a task for each connection to be handled.
-    // receive url until an astarte error is received
-    while let Some(edgehog_url) = rx_url.recv().await {
+    fn set_connections(&mut self, con_handler: ConnectionsHandler) {
+        self.connections = Some(con_handler)
+    }
+
+    /// Method called to establish a new connection between the device and edgehog.
+    #[instrument(skip_all)]
+    pub async fn connect(&mut self, cinfo: ConnectionInfo) -> Result<(), Error> {
+        if self.is_connected() {
+            info!("connection with edgehog already established");
+            return Ok(());
+        }
+
+        let edgehog_url = Url::try_from(cinfo)?;
+
         let session_token = edgehog_url
             .query()
             .expect("session token must be present")
             .to_string();
 
+        // TODO: check what happens when a wrong URL is passed
         // try openning a websocket connection with edgehog using exponential backoff
         let (ws_stream, http_res) =
             backoff::future::retry(ExponentialBackoff::default(), || async {
                 println!("creating websocket connection with {}", edgehog_url);
                 Ok(connect_async(&edgehog_url).await?)
             })
-            .await
-            .map_err(|err| DeviceError::WebSocketConnect(err))?;
+                .await
+                .map_err(Error::WebSocketConnect)?;
 
         debug!(?http_res);
 
-        let (mut connections, mut rx_ws) = Connections::new(session_token, ws_stream);
+        let con_handler = Connections::new(session_token, ws_stream, edgehog_url);
+
+        self.set_connections(con_handler);
+
+        Ok(())
+    }
+
+    pub async fn handle_connections(&mut self) -> Result<(), Error> {
+        let connections = self.connections.as_mut().ok_or_else(|| Error::NonExistingConnection)?;
 
         loop {
             let op = connections
                 // TODO: decide how to set the timeout interval to send Ping frame
-                .select_ws_op(&mut rx_ws, Duration::from_secs(5))
+                .select_ws_op(Duration::from_secs(5))
                 .await;
 
             let res = match op {
@@ -101,20 +135,18 @@ pub async fn start() -> Result<(), DeviceError> {
                     | ConnectionError::Reconnect(err) => {
                         error!(?err);
                         debug!("trying to reconnect");
-                        connections.reconnect(&edgehog_url).await?;
+
+                        let edgehog_url = connections.get_url();
+                        connections.reconnect(edgehog_url).await?;
                     }
                     err => error!(?err),
                 }
             }
         }
+
+        Ok(())
     }
 
-    match handle_astarte.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(err) => {
-            error!("tokio join error, {err}");
-            Ok(())
-        }
-    }
+    // TODO: think about implementing a disconnect() method that can be called from outside the library
+    // to close the websocekt connection between the device and edgehog (therefore close all sessions/connections)
 }
