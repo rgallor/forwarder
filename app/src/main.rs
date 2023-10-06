@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, prelude::*};
+use tracing_subscriber::{prelude::*, EnvFilter};
 use url::Url;
 
 use forwarder::proto_message::{ProtoMessage, WebSocket};
@@ -79,8 +79,8 @@ async fn main_ping_pong() {
         );
         Ok(connect_async("ws://kaiki.local:4000/device/websocket?session=123cacca456").await?)
     })
-        .await
-        .expect("failed to perform exponential backoff1");
+    .await
+    .expect("failed to perform exponential backoff1");
 
     debug!(?http_res);
 

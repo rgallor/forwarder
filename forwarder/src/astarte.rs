@@ -9,10 +9,7 @@ use std::{
 };
 
 use astarte_device_sdk::{
-    AstarteAggregate,
-    error::Error as AstarteError,
-    options::OptionsError,
-    types::AstarteType,
+    error::Error as AstarteError, options::OptionsError, types::AstarteType, AstarteAggregate,
 };
 use displaydoc::Display;
 use thiserror::Error;
@@ -72,9 +69,7 @@ pub struct ConnectionInfo {
 }
 
 impl AstarteAggregate for ConnectionInfo {
-    fn astarte_aggregate(
-        self,
-    ) -> Result<HashMap<String, AstarteType>, AstarteError> {
+    fn astarte_aggregate(self) -> Result<HashMap<String, AstarteType>, AstarteError> {
         let mut hm = HashMap::new();
         hm.insert("host".to_string(), self.host.to_string().into());
         hm.insert("port".to_string(), AstarteType::Integer(self.port.into()));
@@ -94,17 +89,19 @@ impl TryFrom<ConnectionInfo> for Url {
             host => host.to_string(),
         };
 
-        Url::parse(&format!(
-            "ws://{}:{}/path?session_token={}",
-            ip, value.port, value.session_token
-        )).map_err(Error::Parse)
+        Url::parse_with_params(
+            &format!("ws://{}:{}/path", ip, value.port),
+            &[("session_token", value.session_token)],
+        )
+        .map_err(Error::Parse)
     }
 }
 
-
 /// Parse an `HashMap` containing pairs (Endpoint, [`AstarteType`]) into an URL.
 #[instrument(skip_all)]
-pub fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
+pub fn retrieve_connection_info(
+    map: &HashMap<String, AstarteType>,
+) -> Result<ConnectionInfo, Error> {
     let host: &AstarteType = map
         .get("host")
         .ok_or_else(|| Error::MissingUrlInfo("Missing host (IP or domain name)".to_string()))?;
@@ -115,7 +112,7 @@ pub fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
         .get("session_token")
         .ok_or_else(|| Error::MissingUrlInfo("Missing session_token".to_string()))?;
 
-    let data = match (host, port, session_token) {
+    match (host, port, session_token) {
         (
             AstarteType::String(host),
             AstarteType::Integer(port),
@@ -125,14 +122,12 @@ pub fn retrieve_url(map: &HashMap<String, AstarteType>) -> Result<Url, Error> {
             let host = url::Host::parse(host)?;
             let port: u16 = (*port).try_into()?;
 
-            ConnectionInfo {
+            Ok(ConnectionInfo {
                 host,
                 port,
                 session_token,
-            }
+            })
         }
-        _ => return Err(Error::AstarteWrongType),
-    };
-
-    data.try_into()
+        _ => Err(Error::AstarteWrongType),
+    }
 }

@@ -23,9 +23,9 @@ use crate::proto_message::{
 #[non_exhaustive]
 #[derive(Display, Error, Debug)]
 pub enum ConnectionError {
-    /// Error when sending message over websockwet connection, `{0}`.
+    /// Error when sending message over websocket connection, `{0}`.
     WebSocketSend(#[from] TungError),
-    /// Error when receiving message over websockwet connection, `{0}`.
+    /// Error when receiving message over websocket connection, `{0}`.
     WebSocketNext(#[source] TungError),
     /// Protobuf error.
     Protobuf(#[from] ProtoError),
@@ -60,10 +60,13 @@ impl DerefMut for ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    /// Forward a [`protobuf message`](crate::messages::ProtoMessage) to the connection responsible
+    /// for its management.
     pub async fn send_channel(&mut self, ws_msg: WebSocketMessage) -> Result<(), ConnectionError> {
         self.tx_con.send(ws_msg).map_err(|err| err.into())
     }
 
+    /// Gracefully close the task responsible for the connection handling.
     pub async fn close(mut self, ws_msg: WebSocketMessage) -> Result<(), ConnectionError> {
         // send the close frame to the connection
         self.send_channel(ws_msg).await?;
@@ -132,6 +135,7 @@ enum Either {
 #[derive(Debug)]
 pub struct Connection {
     id: Vec<u8>,
+    // TODO: Connection becomes generic on T, where T implements a trait (that is a stream of ProtoMessage)
     stream: WsStream,
     state: ConnState,
     tx_ws: UnboundedSender<ProtoMessage>,
@@ -231,8 +235,8 @@ impl Connection {
 
     /// Read from TTYD-device websocket.
     ///
-    /// This methosd is called only when the `ConnState` is `ConnState::ReadWrite` and `ConnState::Read`
-    #[instrument(skip(self), fields(id = base64::engine::general_purpose::STANDARD.encode(&self.id), state = %self.state))]
+    /// This method is called only when the `ConnState` is `ConnState::ReadWrite` and `ConnState::Read`
+    #[instrument(skip(self), fields(id = base64::engine::general_purpose::STANDARD.encode(& self.id), state = % self.state))]
     fn handle_ws_read(&mut self, data: TungMessage) -> Result<(), ConnectionError> {
         if data.is_close() {
             info!("received close frame from TTYD, changing read state");
@@ -246,8 +250,8 @@ impl Connection {
 
     /// Write to TTYD-device websocket.
     ///
-    /// This methosd is called only when the `ConnState` is `ConnState::ReadWrite` and `ConnState::Write`
-    #[instrument(skip_all, fields(id = base64::engine::general_purpose::STANDARD.encode(&self.id), state = %self.state))]
+    /// This method is called only when the `ConnState` is `ConnState::ReadWrite` and `ConnState::Write`
+    #[instrument(skip_all, fields(id = base64::engine::general_purpose::STANDARD.encode(& self.id), state = % self.state))]
     async fn handle_ws_write(
         &mut self,
         data: Option<WebSocketMessage>,
@@ -306,7 +310,7 @@ mod tests {
             .handle_ws_write(Some(WebSocketMessage::Binary(b"test".to_vec())))
             .await
         {
-            panic!("should have returned error because the ebsocket stream has been closed");
+            panic!("should have returned error because the websocket stream has been closed");
         }
 
         Ok(())

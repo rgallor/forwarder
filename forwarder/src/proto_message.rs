@@ -162,9 +162,13 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub fn is_connection_upgrade(&self) -> bool {
+
+    /// Check if the HTTP request is an "Upgrade" protocol request.
+    ///
+    /// For instance, it is used when a WebSocket connection is established.
+    pub(crate) fn is_connection_upgrade(&self) -> bool {
         self.headers.contains_key("Upgrade")
-    }
+    
 
     pub async fn send(self) -> Result<(Vec<u8>, ReqwResponse), ProtoError> {
         // TODO: the request could be created when deserializing the message coming from edgehog
@@ -312,19 +316,12 @@ impl HttpResponse {
     }
 }
 
-pub fn headermap_to_hashmap<'a, I>(headers: I) -> HashMap<String, String>
+pub fn headermap_to_hashmap<'a, I>(headers: I) -> HashMap<String, Vec<u8>>
 where
     I: Iterator<Item = (&'a HeaderName, &'a HeaderValue)>,
 {
     headers
-        .map(|(name, val)| {
-            (
-                name.to_string(),
-                val.to_str()
-                    .expect("failed to create a string for HeaderValue")
-                    .to_string(),
-            )
-        })
+        .map(|(name, val)| (name.to_string(), val.as_bytes().to_vec()))
         .collect()
 }
 
@@ -350,6 +347,7 @@ impl WebSocket {
         }
     }
 }
+
 #[derive(Debug)]
 pub enum WebSocketMessage {
     Text(String),
